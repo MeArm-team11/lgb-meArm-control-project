@@ -1,21 +1,29 @@
 /*
-  任务一 1.1和1.2：摇杆控制机械臂
+  任务一：MeArm 机械臂基础控制
 
   功能：
-  1. A0、A1、A2、A3 四路摇杆分别控制底座、前臂、后臂和夹爪。
-  2. 上位机发送 O：夹爪张开，发送 S：夹爪关闭。
-  3. 上位机发送 H：提高整体运行速度，发送 L：降低整体运行速度。
+  1. 使用四路摇杆分别控制底座、前臂、后臂和夹爪。
+  2. 通过串口接收固定指令：
+     O：打开夹爪；S：关闭夹爪；
+     H：提高运行速度；L：降低运行速度。
+  3. 通过串口接收 x角度,y角度,z角度 指令，
+     例如 x10,y30,z20，一条指令控制三个舵机。
+     x 对应底座，y 对应前臂，z 对应后臂。
+     输入角度超过关节范围时，限制在安全范围内。
 
-  速度说明：
-  DSD 是舵机每改变 1 度后的等待时间
-  DSD 越小，机械臂运行越快
+  接线：
+  底座舵机 D9，前臂舵机 D8，后臂舵机 D6，夹爪舵机 D7。
+  底座摇杆 A0，前臂摇杆 A3，后臂摇杆 A1，夹爪摇杆 A2。
 
-  更换机械臂时：
-  先修改下面的舵机 PWM 引脚、摇杆输入引脚和舵机角度范围，
-  再根据实际机械限位调试 cOpen、cClose 和初始角度。
+  串口波特率：9600。
+  x,y,z 指令以回车或换行结束。
+  DSD 是每移动 1 度后的等待时间，DSD 越小，运行越快。
+
+  使用前应核对舵机转向、机械限位和夹爪开合角度。
 */
 
 #include <Servo.h>
+#include <stdio.h>
 
 // b底座，f前臂，r后臂，c夹爪
 Servo base, fArm, rArm, claw;
@@ -58,6 +66,10 @@ int DSD = 15;
 const int DSDmin = 2;    // DSD 最小值，速度最快
 const int DSDmax = 60;   // DSD 最大值，速度最慢
 const int DSDstep = 5;   //每次调整的数值
+
+// 暂存一整行串口指令，例如 x10,y30,z20
+char serialLine[40];
+int lineLength = 0;
 
 // 将角度限制在安全范围内
 int limitData(int value, int minValue, int maxValue) {
@@ -212,13 +224,77 @@ void armDataCmd(char name) {
   }
 }
 
+//把从串口中读取的字符串按照格式赋值给xyz,并且调整舵机角度
+void armXYZCmd() {
+  int x, y, z;
+  char extra;
+
+  int count = sscanf(serialLine, " x%d , y%d , z%d %c",&x, &y, &z, &extra);
+
+  if (count == 3) {
+    // 先把目标角度限制在各关节允许的范围内
+    x = limitData(x, bMin, bMax);
+    y = limitData(y, fMin, fMax);
+    z = limitData(z, rMin, rMax);
+
+    // 每轮让三个关节分别向目标移动 1 度
+    while (bPos != x || fPos != y || rPos != z) {
+      if (bPos < x) servoWrite('b', bPos + 1);
+      else if (bPos > x) servoWrite('b', bPos - 1);
+
+      if (fPos < y) servoWrite('f', fPos + 1);
+      else if (fPos > y) servoWrite('f', fPos - 1);
+
+      if (rPos < z) servoWrite('r', rPos + 1);
+      else if (rPos > z) servoWrite('r', rPos - 1);
+
+      delay(DSD);
+    }
+
+    Serial.print("x=");
+    Serial.print(bPos);
+    Serial.print(" y=");
+    Serial.print(fPos);
+    Serial.print(" z=");
+    Serial.println(rPos);
+  } else {
+    Serial.println("指令格式错误");
+  }
+}
 // 读取上位机发送的单字符指令
 void readCmd() {
   while (Serial.available() > 0) {
-    char name = Serial.read();
-    if (name != '\r' && name != '\n') armDataCmd(name);
+    char data = Serial.read();
+
+    if (data == '\r' || data == '\n') {
+      if (lineLength > 0 && lineLength < 40) {
+        serialLine[lineLength] = '\0';
+        armXYZCmd();
+      } else if (lineLength == 40) {
+        Serial.println("指令太长");
+      }
+      lineLength = 0;
+    } else {
+      char name = data;
+      if (name >= 'a' && name <= 'z') name = name - 'a' + 'A';
+
+      if (name == 'O' || name == 'S' || name == 'H' || name == 'L') {
+        armDataCmd(data);
+      } else if (lineLength < 39) {
+        serialLine[lineLength] = data;
+        lineLength++;
+      } else {
+        lineLength = 40;
+      }
+    }
   }
 }
+// void readCmd() {
+//   while (Serial.available() > 0) {
+//     char name = Serial.read();
+//     if (name != '\r' && name != '\n') armDataCmd(name);
+//   }
+// }
 
 void setup() {
   // 初始化电机对应 PWM 针脚
