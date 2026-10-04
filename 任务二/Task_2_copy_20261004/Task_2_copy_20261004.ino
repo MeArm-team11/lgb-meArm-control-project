@@ -1,15 +1,6 @@
 /*
-  任务一：MeArm 机械臂基础控制
-
-  功能：
-  1. 使用四路摇杆分别控制底座、前臂、后臂和夹爪。
-  2. 通过串口接收固定指令：
-     O：打开夹爪；S：关闭夹爪；
-     H：提高运行速度；L：降低运行速度。
-  3. 通过串口接收 x角度,y角度,z角度 指令，
-     例如 x10,y30,z20，一条指令控制三个舵机。
-     x 对应底座，y 对应前臂，z 对应后臂。
-     输入角度超过关节范围时，限制在安全范围内。
+任务二：A/B/C 自动夹取与放置
+  任务二目前仍以任务一的控制逻辑为基础
 
   接线：
   底座舵机 D9，前臂舵机 D8，后臂舵机 D6，夹爪舵机 D7。
@@ -102,6 +93,18 @@ void servoWrite(char name, int value) {
   }
 }
 
+// 输出四个舵机当前状态
+void printStatus() {
+  Serial.print("b=");
+  Serial.print(bPos);
+  Serial.print(" f=");
+  Serial.print(fPos);
+  Serial.print(" r=");
+  Serial.print(rPos);
+  Serial.print(" c=");
+  Serial.println(cPos);
+}
+
 // 使用 switch case 让指定舵机改变一个角度
 void moveJoint(char name, int data) {
   switch (name) {
@@ -176,19 +179,19 @@ void joyCtrl() {
   int dir;
 
   dir = joyDir(bJoy);
-  if (dir != 0) moveJoint('b', -1*dir * joyStep);
+  if (dir != 0) moveJoint('b', -dir * joyStep);
 
   dir = joyDir(fJoy);
-  if (dir != 0) moveJoint('f', -1*dir * joyStep);
+  if (dir != 0) moveJoint('f', -dir * joyStep);
 
   dir = joyDir(rJoy);
-  if (dir != 0) moveJoint('r', -1*dir * joyStep);
+  if (dir != 0) moveJoint('r', -dir * joyStep);
 
   dir = joyDir(cJoy);
   if (dir != 0) moveJoint('c', dir * joyStep);
 }
 
-// 处理上位机固定指令
+// 处理上位机固定OSHL等指令
 void armDataCmd(char name) {
   // 允许上位机发送小写字母
   if (name >= 'a' && name <= 'z') name = name - 'a' + 'A';
@@ -202,6 +205,10 @@ void armDataCmd(char name) {
     case 'S':
       moveTo('c', cClose);
       Serial.println("爪子关闭");
+      break;
+    
+    case 'P':
+      printStatus();
       break;
 
     case 'H':
@@ -279,7 +286,7 @@ void readCmd() {
       char name = data;
       if (name >= 'a' && name <= 'z') name = name - 'a' + 'A';
 
-      if (name == 'O' || name == 'S' || name == 'H' || name == 'L') {
+      if (name == 'O' || name == 'S' || name == 'H' || name == 'L' || name == 'P') {
         armDataCmd(data);
       } else if (lineLength < 39) {
         serialLine[lineLength] = data;
