@@ -95,13 +95,14 @@ void servoWrite(char name, int value) {
 
 // 输出四个舵机当前状态
 void printStatus() {
-  Serial.print("b=");
+  Serial.print("x");
   Serial.print(bPos);
-  Serial.print(" f=");
+  Serial.print(",y");
   Serial.print(fPos);
-  Serial.print(" r=");
-  Serial.print(rPos);
-  Serial.print(" c=");
+  Serial.print(",z");
+  Serial.println(rPos);
+
+  Serial.print("c");
   Serial.println(cPos);
 }
 
