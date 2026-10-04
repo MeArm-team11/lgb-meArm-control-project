@@ -58,6 +58,47 @@ const int DSDmin = 2;    // DSD 最小值，速度最快
 const int DSDmax = 60;   // DSD 最大值，速度最慢
 const int DSDstep = 5;   //每次调整的数值
 
+// 结构体记录一个位置的三个舵机角度
+struct JointPoint {
+  int b;
+  int f;
+  int r;
+};
+
+// 记录一个物体的取放位置和夹爪角度
+struct ActionData {
+  JointPoint getPoint;
+  JointPoint putPoint;
+  int open;
+  int close;
+};
+
+// 任务二的公共安全抬升位置，底座不管
+int fHigh = 120;
+int rHigh = 85;
+
+// A、B、C 的取物点和放置点
+ActionData actionA = {
+  {90, 90, 90}, // 取物点：底座、前臂、后臂
+  {90, 90, 90}, // 放置点：底座、前臂、后臂
+  5,           // 夹爪张开角度
+  90           // 夹爪夹紧角度
+};
+
+ActionData actionB = {
+  {90, 90, 90},
+  {90, 90, 90},
+  5,
+  90
+};
+
+ActionData actionC = {
+  {90, 90, 90},
+  {90, 90, 90},
+  5,
+  90
+};
+
 // 暂存一整行串口指令，例如 x10,y30,z20
 char serialLine[40];
 int lineLength = 0;
@@ -167,6 +208,67 @@ void moveTo(char name, int target) {
   }
 }
 
+// 让前臂和后臂逐度运行到目标角度，底座和夹爪保持不动
+void moveArm(int fTarget, int rTarget) {
+  fTarget = limitData(fTarget, fMin, fMax);
+  rTarget = limitData(rTarget, rMin, rMax);
+
+  while (fPos != fTarget || rPos != rTarget) {
+    if (fPos < fTarget) servoWrite('f', fPos + 1);
+    else if (fPos > fTarget) servoWrite('f', fPos - 1);
+
+    if (rPos < rTarget) servoWrite('r', rPos + 1);
+    else if (rPos > rTarget) servoWrite('r', rPos - 1);
+
+    delay(DSD);
+  }
+}
+
+// 自动动作每一步结束后的等待时间，实测后调整
+const int actionWait = 300;
+// 根据指定物体的数据，完成夹取和放置
+void doAction(ActionData data) {
+  // 1. 大小臂抬到安全姿态，底座不动
+  moveArm(fHigh, rHigh);
+  delay(actionWait);
+
+  // 2. 打开夹爪
+  moveTo('c', data.open);
+  delay(actionWait);
+
+  // 3. 底座转到取物方向，大小臂不动
+  moveTo('b', data.getPoint.b);
+  delay(actionWait);
+
+  // 4. 大小臂移动到取物点，底座不动
+  moveArm(data.getPoint.f, data.getPoint.r);
+  delay(actionWait);
+
+  // 5. 夹紧物体
+  moveTo('c', data.close);
+  delay(actionWait);
+
+  // 6. 大小臂抬到安全姿态，底座不动
+  moveArm(fHigh, rHigh);
+  delay(actionWait);
+
+  // 7. 底座转到放置方向，大小臂不动
+  moveTo('b', data.putPoint.b);
+  delay(actionWait);
+
+  // 8. 大小臂移动到放置点，底座不动
+  moveArm(data.putPoint.f, data.putPoint.r);
+  delay(actionWait);
+
+  // 9. 打开夹爪，放下物体
+  moveTo('c', data.open);
+  delay(actionWait);
+
+  // 10. 大小臂再次抬到安全姿态
+  moveArm(fHigh, rHigh);
+  delay(actionWait);
+}
+
 // 读取摇杆方向：1 正向，-1 反向，0 停止
 int joyDir(int pin) {
   int joyData = analogRead(pin) - joyCenter;
@@ -224,6 +326,24 @@ void armDataCmd(char name) {
       if (DSD > DSDmax) DSD = DSDmax;
       Serial.print("降低速度，DSD=");
       Serial.println(DSD);
+      break;
+
+    case 'A':
+      Serial.println("开始执行A");
+      doAction(actionA);
+      Serial.println("A动作指令执行结束");
+      break;
+
+    case 'B':
+      Serial.println("开始执行B");
+      doAction(actionB);
+      Serial.println("B动作指令执行结束");
+      break;
+
+    case 'C':
+      Serial.println("开始执行C");
+      doAction(actionC);
+      Serial.println("C动作指令执行结束");
       break;
 
     default:
@@ -287,7 +407,8 @@ void readCmd() {
       char name = data;
       if (name >= 'a' && name <= 'z') name = name - 'a' + 'A';
 
-      if (name == 'O' || name == 'S' || name == 'H' || name == 'L' || name == 'P') {
+      if (name == 'O' || name == 'S' || name == 'H' || name == 'L' || 
+          name == 'P' || name == 'A' || name == 'B' || name == 'C'    ) {
         armDataCmd(data);
       } else if (lineLength < 39) {
         serialLine[lineLength] = data;
