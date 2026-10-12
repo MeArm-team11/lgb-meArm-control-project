@@ -50,7 +50,7 @@ const int cJoy = A2; // c夹爪摇杆
 const int bMin = 0;   const int bMax = 180; // b底座
 const int fMin = 0;  const int fMax = 150; // f前臂15 120
 const int rMin = 0;  const int rMax = 180; // r后臂
-const int cMin = 5;   const int cMax = 100;  // c夹爪
+const int cMin = 5;   const int cMax = 110;  // c夹爪
 
 //夹爪开合角度，实物方向相反时交换 cOpen 和 cClose
 const int cOpen = cMin;
@@ -91,6 +91,22 @@ int targetC = cMax;  // 夹爪的目标角度
 // 上一次自动运动步进的时间，单位：毫秒
 unsigned long lastMotionStep = 0;
 unsigned long lastJoyStep = 0;  // 上一次处理摇杆的时间
+// 0：没有回中；1：大小臂回中；2：底座回中；3：夹爪回中
+int homeStep = 0;
+
+// 播放流程：0 空闲；1 回起点；2 正在播放
+int playStage = 0;
+// 回起点走到第几步
+int returnStep = 0;
+// 下一次要播放第几帧
+int playIndex = 0;
+// 播放起点的时间戳
+unsigned long playBegin = 0;
+
+// 0：还没有开始停顿计时；1：正在停顿计时
+int homeWaiting = 0;
+
+unsigned long homeWaitStart = 0;
 
 // 结构体记录一个位置的三个舵机角度
 struct JointPoint {
@@ -106,6 +122,16 @@ struct ActionData {
   int open;
   int close;
 };
+
+// 当前正在执行的取放数据
+ActionData currentAction;
+
+// 取放流程：0 表示空闲，1~10 表示当前步骤
+int actionStep = 0;
+
+// 是否正在进行步骤之间的停顿
+int actionWaiting = 0;
+unsigned long actionWaitStart = 0;
 
 // 录制时保存的一帧：四个舵机角度和录制后的时间
 struct RecordFrame {
@@ -328,6 +354,100 @@ void playRecord() {
   printStatus();
 }
 
+// 启动播放：只检查和安排第一步
+void playStart() {
+  if (recording) {
+    Serial.println("请先停止录制");
+    return;
+  }
+
+  if (frameCount < 2) {
+    Serial.println("没有足够的录制数据");
+    return;
+  }
+
+  if (playStage != 0) {
+    Serial.println("正在播放，请等待");
+    return;
+  }
+
+  // 当前姿态和第一帧不一致，先回起点
+  if (bPos != recordData[0].b ||
+      fPos != recordData[0].f ||
+      rPos != recordData[0].r ||
+      cPos != recordData[0].c) {
+    Serial.println("正在返回录制起点");
+    playStage = 1;
+    returnStep = 0;
+    startJointTarget(recordData[0].b, fPos, rPos, cPos);
+    return;
+  }
+
+  // 姿态已经对上，直接播放
+  playStage = 2;
+  playIndex = 0;
+  playBegin = millis();
+  Serial.println("开始播放");
+}
+
+// 每次循环推进一小步播放流程
+void playCtrl() {
+  if (playStage == 0) {
+    return;
+  }
+
+  // ---------- 阶段 1：回到录制起点 ----------
+  if (playStage == 1) {
+    // 当前这一段还没有走完
+    if (motionState != 0) {
+      return;
+    }
+
+    if (returnStep == 0) {
+      returnStep = 1;
+      startJointTarget(bPos, recordData[0].f, recordData[0].r, cPos);
+      return;
+    }
+
+    if (returnStep == 1) {
+      returnStep = 2;
+      startJointTarget(bPos, fPos, rPos, recordData[0].c);
+      return;
+    }
+
+    // 三步都走完，进入播放
+    playStage = 2;
+    playIndex = 0;
+      playBegin = millis();
+    Serial.println("开始播放");
+    return;
+  }
+
+  // ---------- 阶段 2：按录制时间播放 ----------
+  if (playStage == 2) {
+    // 所有帧都播完
+    if (playIndex >= frameCount) {
+      playStage = 0;
+      Serial.println("播放指令执行结束");
+      printStatus();
+      return;
+    }
+
+    // 还没到这一帧的时刻，等下一轮
+    if (millis() - playBegin < recordData[playIndex].timeMs) {
+      return;
+    }
+
+    // 写入这一帧的角度
+    servoWrite('b', recordData[playIndex].b);
+    servoWrite('f', recordData[playIndex].f);
+    servoWrite('r', recordData[playIndex].r);
+    servoWrite('c', recordData[playIndex].c);
+
+    playIndex++;
+  }
+}
+
 // 设置目标，启动三关节自动运动
 void startJointTarget(int bTarget, int fTarget, int rTarget,int cTarget) {
   // 忙碌时不接受新的运动目标
@@ -366,8 +486,11 @@ void stepJointTarget() {
   // 已经到达目标，结束运动
   if (jointTargetReached() == 1) {
     motionState = 0;
-    Serial.println("自动运动结束");
-    printStatus();
+    // 单独运动时输出；连续流程由各自的控制函数输出完成提示
+    if (homeStep == 0 && actionStep == 0) {
+      Serial.println("自动运动结束");
+      printStatus();
+    }
     return;
   }
 
@@ -486,46 +609,128 @@ void moveArm(int fTarget, int rTarget) {
 }
 
 // 根据指定物体的数据，完成夹取和放置
+// 根据 actionStep，启动对应的一段运动
+void startActionStep() {
+  switch (actionStep) {
+    case 1:
+      // 大小臂抬升
+      startJointTarget(bPos, fHigh, rHigh, cPos);
+      break;
+
+    case 2:
+      // 张开夹爪
+      startJointTarget(bPos, fPos, rPos, currentAction.open);
+      break;
+
+    case 3:
+      // 底座转向取物点
+      startJointTarget(currentAction.getPoint.b, fPos, rPos, cPos);
+      break;
+
+    case 4:
+      // 大小臂到达取物点
+      startJointTarget(bPos,
+                       currentAction.getPoint.f,
+                       currentAction.getPoint.r,
+                       cPos);
+      break;
+
+    case 5:
+      // 夹紧物体
+      startJointTarget(bPos, fPos, rPos, currentAction.close);
+      break;
+
+    case 6:
+      // 夹取后抬升
+      startJointTarget(bPos, fHigh, rHigh, cPos);
+      break;
+
+    case 7:
+      // 底座转向放置点
+      startJointTarget(currentAction.putPoint.b, fPos, rPos, cPos);
+      break;
+
+    case 8:
+      // 大小臂到达放置点
+      startJointTarget(bPos,
+                       currentAction.putPoint.f,
+                       currentAction.putPoint.r,
+                       cPos);
+      break;
+
+    case 9:
+      // 张开夹爪，放下物体
+      startJointTarget(bPos, fPos, rPos, currentAction.open);
+      break;
+
+    case 10:
+      // 放置后再次抬升
+      startJointTarget(bPos, fHigh, rHigh, cPos);
+      break;
+
+    default:
+      return;
+  }
+
+  // 底层没有接受目标，就结束流程，不跳过失败步骤
+  if (motionState != 1) {
+    actionStep = 0;
+    actionWaiting = 0;
+    lastJoyStep = millis();
+    Serial.println("取放步骤启动失败，流程已停止");
+  }
+}
+// 保存本次动作数据，启动第一步
 void doAction(ActionData data) {
-  // 1. 大小臂抬到安全姿态，底座不动
-  moveArm(fHigh, rHigh);
-  delay(actionWait);
+  if (motionState != 0 || homeStep != 0 || actionStep != 0 || playStage != 0) {
+    Serial.println("正在运动，请等待");
+    return;
+  }
 
-  // 2. 打开夹爪
-  moveTo('c', data.open);
-  delay(actionWait);
+  currentAction = data;
+  actionStep = 1;
+  actionWaiting = 0;
 
-  // 3. 底座转到取物方向，大小臂不动
-  moveTo('b', data.getPoint.b);
-  delay(actionWait);
+  startActionStep();
+}
+// 每次循环检查一次取放进度
+void actionCtrl() {
+  if (actionStep == 0) {
+    return;
+  }
 
-  // 4. 大小臂移动到取物点，底座不动
-  moveArm(data.getPoint.f, data.getPoint.r);
-  delay(actionWait);
+  // 当前这一段还没有结束
+  if (motionState != 0) {
+    return;
+  }
 
-  // 5. 夹紧物体
-  moveTo('c', data.close);
-  delay(actionWait);
+  // 当前这一段结束，开始停顿计时
+  if (actionWaiting == 0) {
+    actionWaitStart = millis();
+    actionWaiting = 1;
+    return;
+  }
 
-  // 6. 大小臂抬到安全姿态，底座不动
-  moveArm(fHigh, rHigh);
-  delay(actionWait);
+  // 停顿时间还没有到
+  if (millis() - actionWaitStart < (unsigned long)actionWait) {
+    return;
+  }
 
-  // 7. 底座转到放置方向，大小臂不动
-  moveTo('b', data.putPoint.b);
-  delay(actionWait);
+  actionWaiting = 0;
 
-  // 8. 大小臂移动到放置点，底座不动
-  moveArm(data.putPoint.f, data.putPoint.r);
-  delay(actionWait);
+  // 最后一步及停顿结束
+  if (actionStep == 10) {
+    actionStep = 0;
+    lastJoyStep = millis();
 
-  // 9. 打开夹爪，放下物体
-  moveTo('c', data.open);
-  delay(actionWait);
+    Serial.println("取放动作执行结束");
+    printStatus();
+    return;
+  }
 
-  // 10. 大小臂再次抬到安全姿态
-  moveArm(fHigh, rHigh);
-  delay(actionWait);
+  // 开始下一步
+  actionStep++;
+  startActionStep();
 }
 
 // 下次按键1要执行的物体
@@ -554,23 +759,70 @@ void nextAction() {
   }
 }
 
-// 回到上电初始姿态，先抬大小臂，再转底座
+// 启动回中流程，只安排第一步
 void goHome() {
-  // 1. 大小臂抬到安全姿态，底座和夹爪不动
-  moveArm(fHigh, rHigh);
-  delay(actionWait);
+  // 防止正在运动时重复启动回中
+  if (motionState != 0 || homeStep != 0 || actionStep != 0) {
+    Serial.println("正在运动，请等待");
+    return;
+  }
 
-  // 2. 底座回到初始方向
-  moveTo('b', bHome);
-  delay(actionWait);
+  homeStep = 1;
+  homeWaiting = 0;
 
-  // 3. 大小臂回到初始角度
-  moveArm(fHome, rHome);
-  delay(actionWait);
+  Serial.println("开始回中");
 
-  // 4. 夹爪回到初始角度
-  moveTo('c', cHome);
-  delay(actionWait);
+  // 第一步：大小臂直接回中，底座和夹爪保持不动
+  startJointTarget(bPos, fHome, rHome, cPos);
+}
+
+// 检查回中进度，每次只处理一小步
+void homeCtrl() {
+  if (homeStep == 0) {
+    return;
+  }
+
+  // 当前这段运动还没有结束
+  if (motionState != 0) {
+    return;
+  }
+
+  // 当前这段结束，开始停顿计时
+  if (homeWaiting == 0) {
+    homeWaitStart = millis();
+    homeWaiting = 1;
+    return;
+  }
+
+  // 停顿时间未到
+  if (millis() - homeWaitStart < (unsigned long)actionWait) {
+    return;
+  }
+
+  homeWaiting = 0;
+
+    switch (homeStep) {
+    case 1:
+      // 大小臂回中完成，开始底座回中
+      homeStep = 2;
+      startJointTarget(bHome, fPos, rPos, cPos);
+      break;
+
+    case 2:
+      // 底座回中完成，开始夹爪回中
+      homeStep = 3;
+      startJointTarget(bPos, fPos, rPos, cHome);
+      break;
+
+    case 3:
+      // 三步及最后的停顿全部完成
+      homeStep = 0;
+      lastJoyStep = millis();
+
+      Serial.println("回中指令执行结束");
+      printStatus();
+      break;
+  }
 }
 
 // 读取摇杆方向：1 正向，-1 反向，0 停止
@@ -602,8 +854,7 @@ void joyCtrl() {
 void armDataCmd(char name) {
   // 允许上位机发送小写字母
   if (name >= 'a' && name <= 'z') name = name - 'a' + 'A';
-  // 自动运动期间，只允许查看状态和调整速度
-  if (motionState != 0 &&
+  if ((motionState != 0 || homeStep != 0 || actionStep != 0 || playStage != 0) &&
       name != 'P' &&
       name != 'H' &&
       name != 'L') {
@@ -636,30 +887,24 @@ void armDataCmd(char name) {
       Serial.print("降低速度，DSD=");
       Serial.println(DSD);
       break;
-
+      
     case 'A':
       Serial.println("开始执行A");
       doAction(actionA);
-      Serial.println("A动作指令执行结束");
       break;
 
     case 'B':
       Serial.println("开始执行B");
       doAction(actionB);
-      Serial.println("B动作指令执行结束");
       break;
 
     case 'C':
       Serial.println("开始执行C");
       doAction(actionC);
-      Serial.println("C动作指令执行结束");
       break;
-   
+
     case 'M':
-      Serial.println("开始回中");
       goHome();
-      Serial.println("回中指令执行结束");
-      printStatus();
       break;
 
     case 'N':
@@ -669,9 +914,9 @@ void armDataCmd(char name) {
     case 'R':
       recordCmd();
       break;
-
+    
     case 'T':
-      playRecord();
+      playStart();
       break;
 
     default:
@@ -682,6 +927,10 @@ void armDataCmd(char name) {
 
 // 解析三个舵机的目标角度，启动非阻塞运动
 void armXYZCmd() {
+  if (homeStep != 0 || actionStep != 0) {
+    Serial.println("正在执行自动流程，暂不接受角度指令");
+    return;
+  }
   int x, y, z;
   char extra;
 
@@ -702,7 +951,6 @@ void armXYZCmd() {
 void readCmd() {
   while (Serial.available() > 0) {
     char data = Serial.read();
-
     if (data == '\r' || data == '\n') {
       if (lineLength > 0 && lineLength < 40) {
         serialLine[lineLength] = '\0';
@@ -759,19 +1007,21 @@ void setup() {
 }
 
 void loop() {
-  readCmd();// 随时处理串口指令
-  stepJointTarget(); // 自动运动每次最多走一步
-  // 只有没有自动运动时，才允许摇杆控制
-  if (motionState == 0) {
+  readCmd();
+  stepJointTarget();
+  homeCtrl();
+  actionCtrl();
+  playCtrl();
+
+  // 所有自动流程都空闲，才允许摇杆控制
+  if (motionState == 0 && homeStep == 0 && actionStep == 0 && playStage == 0) {
     unsigned long now = millis();
-    // 保持原来大约每 DSD 毫秒处理一次摇杆的节奏
     if (now - lastJoyStep >= (unsigned long)DSD) {
       lastJoyStep = now;
       joyCtrl();
     }
   } else {
-    lastJoyStep = millis(); // 自动运动期间更新计时起点
+    lastJoyStep = millis();
   }
-
-  recordCtrl(); // 保留录制采样
+  recordCtrl();
 }
