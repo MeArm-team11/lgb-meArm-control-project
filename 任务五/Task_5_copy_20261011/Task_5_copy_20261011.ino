@@ -17,15 +17,15 @@
   | T | 回放录制动作 |
   发送 x90,y60,z100 并以回车或换行结束，可分别设置底座、前臂、后臂的目标角度。
 
-  接线：
+接线：
   底座舵机 D9，前臂舵机 D8，后臂舵机 D6，夹爪舵机 D7。
   底座摇杆 A0，前臂摇杆 A3，后臂摇杆 A1，夹爪摇杆 A2。
 
-  串口波特率：9600。
-  x,y,z 指令以回车或换行结束。
-  DSD 是每移动 1 度后的等待时间，DSD 越小，运行越快。
+串口波特率：9600。
+x,y,z 指令以回车或换行结束。
+DSD 是每移动 1 度后的等待时间，DSD 越小，运行越快。
 
-  使用前应核对舵机转向、机械限位和夹爪开合角度。
+使用前应核对舵机转向、机械限位和夹爪开合角度。
 */
 
 #include <Servo.h>
@@ -50,11 +50,11 @@ const int cJoy = A2; // c夹爪摇杆
 const int bMin = 0;   const int bMax = 180; // b底座
 const int fMin = 0;  const int fMax = 150; // f前臂15 120
 const int rMin = 0;  const int rMax = 180; // r后臂
-const int cMin = 5;   const int cMax = 80;  // c夹爪
+const int cMin = 5;   const int cMax = 100;  // c夹爪
 
 //夹爪开合角度，实物方向相反时交换 cOpen 和 cClose
-const int cOpen = cMin;   // 爪子张开：5度
-const int cClose = cMax;  // 爪子关闭：90度
+const int cOpen = cMin;
+const int cClose = cMax;  
 
 //上电后的初始角度
 int bPos = 90;
@@ -74,12 +74,23 @@ const int joyDead = 100;   // 摇杆死区，防止松手时抖动
 const int joyStep = 1;     // 每次循环改变的角度
 
 //速度参数：DSD 是等待时间，越小越快
-int DSD = 15;
+int DSD = 20;
 const int DSDmin = 2;    // DSD 最小值，速度最快
 const int DSDmax = 60;   // DSD 最大值，速度最慢
 const int DSDstep = 5;   //每次调整的数值
 // 自动动作每一步结束后的等待时间，实测后调整
 const int actionWait = 300;
+
+//任务五新增状态记录
+int motionState = 0;  // 0：没有自动运动；1：正在自动运动
+// 自动运动的目标角度
+int targetB = 90;  // 底座的目标角度
+int targetF = 90;  // 前臂舵机的目标角度
+int targetR = 90;  // 后臂舵机的目标角度
+int targetC = 80;  // 夹爪的目标角度
+// 上一次自动运动步进的时间，单位：毫秒
+unsigned long lastMotionStep = 0;
+unsigned long lastJoyStep = 0;  // 上一次处理摇杆的时间
 
 // 结构体记录一个位置的三个舵机角度
 struct JointPoint {
@@ -202,6 +213,19 @@ void servoWrite(char name, int value) {
   }
 }
 
+// 判断三个舵机的指令角度是否都已到达目标
+// 返回 1：全部到达；返回 0：还有没到达的
+int jointTargetReached() {
+  if (bPos == targetB &&
+      fPos == targetF &&
+      rPos == targetR &&
+      cPos == targetC) {
+    return 1;
+  }
+
+  return 0;
+}
+
 // 输出四个舵机当前状态
 void printStatus() {
   Serial.print("x");
@@ -210,7 +234,6 @@ void printStatus() {
   Serial.print(fPos);
   Serial.print(",z");
   Serial.println(rPos);
-
   Serial.print("c");
   Serial.println(cPos);
 }
@@ -303,6 +326,86 @@ void playRecord() {
 
   Serial.println("播放指令执行结束");
   printStatus();
+}
+
+// 设置目标，启动三关节自动运动
+void startJointTarget(int bTarget, int fTarget, int rTarget,int cTarget) {
+  // 忙碌时不接受新的运动目标
+  if (motionState != 0) {
+    Serial.println("正在运动，请等待");
+    return;
+  }
+
+  // 超出范围就拒绝，不擅自改变目标
+  if (bTarget < bMin || bTarget > bMax ||
+      fTarget < fMin || fTarget > fMax ||
+      rTarget < rMin || rTarget > rMax ||
+      cTarget < cMin || cTarget > cMax) {
+    Serial.println("目标角度超出范围");
+    return;
+  }
+
+  targetB = bTarget;
+  targetF = fTarget;
+  targetR = rTarget;
+  targetC = cTarget;
+
+  lastMotionStep = millis();
+  motionState = 1;
+
+  Serial.println("开始自动运动");
+}
+
+// 每次调用，最多让三个关节各向目标靠近 1 度
+void stepJointTarget() {
+  // 不是自动运动状态，就不处理
+  if (motionState != 1) {
+    return;
+  }
+
+  // 已经到达目标，结束运动
+  if (jointTargetReached() == 1) {
+    motionState = 0;
+    Serial.println("自动运动结束");
+    printStatus();
+    return;
+  }
+
+  // 间隔不足 DSD 毫秒，本次先不动
+  unsigned long now = millis();
+
+  if (now - lastMotionStep < (unsigned long)DSD) {
+    return;
+  }
+
+  lastMotionStep = now;
+
+  // 底座向目标靠近 1 度
+  if (bPos < targetB) {
+    servoWrite('b', bPos + 1);
+  } else if (bPos > targetB) {
+    servoWrite('b', bPos - 1);
+  }
+
+  // 前臂向目标靠近 1 度
+  if (fPos < targetF) {
+    servoWrite('f', fPos + 1);
+  } else if (fPos > targetF) {
+    servoWrite('f', fPos - 1);
+  }
+
+  // 后臂向目标靠近 1 度
+  if (rPos < targetR) {
+    servoWrite('r', rPos + 1);
+  } else if (rPos > targetR) {
+    servoWrite('r', rPos - 1);
+  }
+  // 夹爪向目标靠近 1 度
+  if (cPos < targetC) {
+    servoWrite('c', cPos + 1);
+  } else if (cPos > targetC) {
+    servoWrite('c', cPos - 1);
+  }
 }
 
 // 使用 switch case 让指定舵机改变一个角度
@@ -499,16 +602,21 @@ void joyCtrl() {
 void armDataCmd(char name) {
   // 允许上位机发送小写字母
   if (name >= 'a' && name <= 'z') name = name - 'a' + 'A';
-
+  // 自动运动期间，只允许查看状态和调整速度
+  if (motionState != 0 &&
+      name != 'P' &&
+      name != 'H' &&
+      name != 'L') {
+    Serial.println("正在自动运动，暂不接受此指令");
+    return;
+  }
   switch (name) {
     case 'O':
-      moveTo('c', cOpen);
-      Serial.println("爪子张开");
+      startJointTarget(bPos, fPos, rPos, cOpen);
       break;
 
     case 'S':
-      moveTo('c', cClose);
-      Serial.println("爪子关闭");
+      startJointTarget(bPos, fPos, rPos, cClose);
       break;
     
     case 'P':
@@ -572,39 +680,19 @@ void armDataCmd(char name) {
   }
 }
 
-//把从串口中读取的字符串按照格式赋值给xyz,并且调整舵机角度
+// 解析三个舵机的目标角度，启动非阻塞运动
 void armXYZCmd() {
   int x, y, z;
   char extra;
 
-  int count = sscanf(serialLine, " x%d , y%d , z%d %c",&x, &y, &z, &extra);
+  int count = sscanf(
+    serialLine,
+    " x%d , y%d , z%d %c",
+    &x, &y, &z, &extra
+  );
 
   if (count == 3) {
-    // 先把目标角度限制在各关节允许的范围内
-    x = limitData(x, bMin, bMax);
-    y = limitData(y, fMin, fMax);
-    z = limitData(z, rMin, rMax);
-
-    // 每轮让三个关节分别向目标移动 1 度
-    while (bPos != x || fPos != y || rPos != z) {
-      if (bPos < x) servoWrite('b', bPos + 1);
-      else if (bPos > x) servoWrite('b', bPos - 1);
-
-      if (fPos < y) servoWrite('f', fPos + 1);
-      else if (fPos > y) servoWrite('f', fPos - 1);
-
-      if (rPos < z) servoWrite('r', rPos + 1);
-      else if (rPos > z) servoWrite('r', rPos - 1);
-
-      delay(DSD);
-    }
-
-    Serial.print("x=");
-    Serial.print(bPos);
-    Serial.print(" y=");
-    Serial.print(fPos);
-    Serial.print(" z=");
-    Serial.println(rPos);
+    startJointTarget(x, y, z, cPos);
   } else {
     Serial.println("指令格式错误");
   }
@@ -671,8 +759,19 @@ void setup() {
 }
 
 void loop() {
-  readCmd(); // 先处理上位机固定指令
-  joyCtrl(); // 再读取摇杆
-  recordCtrl(); // 录制时按间隔保存更新后的角度
-  delay(DSD); // DSD 是机械臂整体运行的等待时间
+  readCmd();// 随时处理串口指令
+  stepJointTarget(); // 自动运动每次最多走一步
+  // 只有没有自动运动时，才允许摇杆控制
+  if (motionState == 0) {
+    unsigned long now = millis();
+    // 保持原来大约每 DSD 毫秒处理一次摇杆的节奏
+    if (now - lastJoyStep >= (unsigned long)DSD) {
+      lastJoyStep = now;
+      joyCtrl();
+    }
+  } else {
+    lastJoyStep = millis(); // 自动运动期间更新计时起点
+  }
+
+  recordCtrl(); // 保留录制采样
 }
