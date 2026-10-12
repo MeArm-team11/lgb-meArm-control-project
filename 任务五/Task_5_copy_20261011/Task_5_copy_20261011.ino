@@ -30,9 +30,12 @@ DSD 是每移动 1 度后的等待时间，DSD 越小，运行越快。
 
 #include <Servo.h>
 #include <stdio.h>
+#include "types.h"
 
 // b底座，f前臂，r后臂，c夹爪
 Servo base, fArm, rArm, claw;
+
+// 结构体定义已移至 types.h
 
 //舵机 PWM 引脚，换机械臂先改这里
 const int bPin = 9;  // b底座
@@ -62,6 +65,80 @@ int fPos = 90;
 int rPos = 90;
 int cPos = cMax;
 
+// 运动学参数
+// 单位：毫米。当前为任务四文档的名义值，实测校正后再替换
+const float L1  = 80.0;   // 大臂轴心距
+const float L2  = 80.0;   // 小臂轴心距
+const float L3a = 60.0;   // 底座回转轴 -> 肩轴，水平距离
+const float L3b = 15.0;   // 腕轴 -> 夹持参考点，水平距离
+const float h   = 65.0;   // 肩轴相对安装面的高度
+
+// 逆解算出的角度超出这个差值，视为不可达
+const float ARM_EPS = 0.001;
+
+// 把值限制到 [-1, 1]，供 acos() 使用
+// 浮点误差可能算出 1.0000001，acos() 会返回 nan
+float clampUnit(float value) {
+  if (value > 1.0) return 1.0;
+  if (value < -1.0) return -1.0;
+  return value;
+}
+
+// ==================== 正解 FK ====================
+// 输入三个数学角度（度）：theta 底座回转角，alpha 大臂倾角，beta 小臂相对角
+// 输出夹持参考点的坐标（毫米）
+void forwardKinematics(float theta, float alpha, float beta,
+                       float &X, float &Y, float &Z) {
+  float thetaRad = radians(theta);
+  float alphaRad = radians(alpha);
+  float betaRad  = radians(beta);
+
+  // R = L3a + L1*cos(alpha) + L2*sin(alpha+beta) + L3b
+  float R = L3a + L1 * cos(alphaRad) + L2 * sin(alphaRad + betaRad) + L3b;
+
+  // X = R*cos(theta)，Y = R*sin(theta)
+  X = R * cos(thetaRad);
+  Y = R * sin(thetaRad);
+
+  // Z = h + L1*sin(alpha) - L2*cos(alpha+beta)
+  Z = h + L1 * sin(alphaRad) - L2 * cos(alphaRad + betaRad);
+}
+
+// ==================== 逆解 IK ====================
+// 输入目标坐标（毫米），输出三个数学角度（度）
+// 返回 true 表示求解成功；返回 false 表示目标不可达
+bool inverseKinematics(float X, float Y, float Z,
+                       float &theta, float &alpha, float &beta) {
+  // R = sqrt(X^2 + Y^2)
+  float R = sqrt(X * X + Y * Y);
+
+  // theta = atan2(Y, X)。注意是 atan2 不是 atan，能分四个象限
+  theta = degrees(atan2(Y, X));
+
+  // 扣掉固定偏移，化成两杆问题
+  float r = R - L3a - L3b;
+  float z = Z - h;
+
+  // d = 目标点到肩轴的距离
+  float d = sqrt(r * r + z * z);
+
+  // 可达性判定：|L1-L2| <= d <= L1+L2
+  // 故意不夹紧到边界，明显不可达就返回失败
+  if (d > L1 + L2 + ARM_EPS) return false;
+  if (d < fabs(L1 - L2) - ARM_EPS) return false;
+
+  // phi 是目标点方位角，gammaS 是肩部内角，eta 是肘部内角
+  float phi    = atan2(z, r);
+  float gammaS = acos(clampUnit((L1 * L1 + d * d - L2 * L2) / (2.0 * L1 * d)));
+  float eta    = acos(clampUnit((L1 * L1 + L2 * L2 - d * d) / (2.0 * L1 * L2)));
+
+  // alpha = phi + gammaS，beta = eta - 90度
+  alpha = degrees(phi + gammaS);
+  beta  = degrees(eta) - 90.0;
+
+  return true;
+}
+
 // 上电初始角度，也是任务三的回中目标
 const int bHome = 90;
 const int fHome = 90;
@@ -74,7 +151,7 @@ const int joyDead = 100;   // 摇杆死区，防止松手时抖动
 const int joyStep = 1;     // 每次循环改变的角度
 
 //速度参数：DSD 是等待时间，越小越快
-int DSD = 20;
+int DSD = 35;
 const int DSDmin = 2;    // DSD 最小值，速度最快
 const int DSDmax = 60;   // DSD 最大值，速度最慢
 const int DSDstep = 5;   //每次调整的数值
@@ -108,21 +185,6 @@ int homeWaiting = 0;
 
 unsigned long homeWaitStart = 0;
 
-// 结构体记录一个位置的三个舵机角度
-struct JointPoint {
-  int b;
-  int f;
-  int r;
-};
-
-// 记录一个物体的取放位置和夹爪角度
-struct ActionData {
-  JointPoint getPoint;
-  JointPoint putPoint;
-  int open;
-  int close;
-};
-
 // 当前正在执行的取放数据
 ActionData currentAction;
 
@@ -132,15 +194,6 @@ int actionStep = 0;
 // 是否正在进行步骤之间的停顿
 int actionWaiting = 0;
 unsigned long actionWaitStart = 0;
-
-// 录制时保存的一帧：四个舵机角度和录制后的时间
-struct RecordFrame {
-  byte b;
-  byte f;
-  byte r;
-  byte c;
-  unsigned long timeMs;
-};
 
 // 录制容量和采样间隔
 const int recordMax = 80;
@@ -167,13 +220,13 @@ void recordCmd() {
     // 先保存开始录制时的姿态
     saveFrame();
 
-    Serial.println("开始录制");
+    Serial.println(F("开始录制"));
   } else {
     // 保存停止时的姿态，数组已满时 saveFrame() 不再写入
     saveFrame();
     recording = false;
 
-    Serial.print("录制结束，帧数=");
+    Serial.print(F("录制结束，帧数="));
     Serial.println(frameCount);
   }
 }
@@ -254,13 +307,13 @@ int jointTargetReached() {
 
 // 输出四个舵机当前状态
 void printStatus() {
-  Serial.print("x");
+  Serial.print(F("x"));
   Serial.print(bPos);
-  Serial.print(",y");
+  Serial.print(F(",y"));
   Serial.print(fPos);
-  Serial.print(",z");
+  Serial.print(F(",z"));
   Serial.println(rPos);
-  Serial.print("c");
+  Serial.print(F("c"));
   Serial.println(cPos);
 }
 
@@ -277,14 +330,14 @@ void recordCtrl() {
     // 存满后自动结束，不再继续写入
     if (frameCount >= recordMax) {
       recording = false;
-      Serial.println("录制容量已满，自动停止");
-      Serial.print("帧数=");
+      Serial.println(F("录制容量已满，自动停止"));
+      Serial.print(F("帧数="));
       Serial.println(frameCount);
     }
   }
 }
 
-// 保存当前四个舵机的设定角度和录制时间
+// 保存当前四个舵机的设定角度
 void saveFrame() {
   // 数组已满，不继续写入
   if (frameCount >= recordMax) return;
@@ -293,81 +346,24 @@ void saveFrame() {
   recordData[frameCount].f = fPos;
   recordData[frameCount].r = rPos;
   recordData[frameCount].c = cPos;
-  recordData[frameCount].timeMs = millis() - recordStart;
 
   frameCount++;
-}
-
-// 按录制时间播放四个舵机的角度
-void playRecord() {
-  // 录制期间不允许播放
-  if (recording) {
-    Serial.println("请先停止录制");
-    return;
-  }
-
-  // 至少需要两帧
-  if (frameCount < 2) {
-    Serial.println("没有足够的录制数据");
-    return;
-  }
-
-  // 当前姿态与第一帧不一致时，先自动回到录制起点
-  if (bPos != recordData[0].b || fPos != recordData[0].f ||
-      rPos != recordData[0].r || cPos != recordData[0].c) {
-    Serial.println("正在返回录制起点");
-    // 底座转到第一帧的方向
-    moveTo('b', recordData[0].b);
-    delay(actionWait);
-
-    // 大小臂移动到第一帧的位置
-    moveArm(recordData[0].f, recordData[0].r);
-    delay(actionWait);
-
-    // 夹爪恢复第一帧的角度
-    moveTo('c', recordData[0].c);
-    delay(actionWait);
-  }
-
-  Serial.println("开始播放");
-
-  unsigned long playStart = millis();
-
-  for (int i = 0; i < frameCount; i++) {
-    // 以第一帧为播放时间起点
-    unsigned long frameTime =
-        recordData[i].timeMs - recordData[0].timeMs;
-
-    // 等到这一帧对应的时刻
-    while (millis() - playStart < frameTime) {
-      delay(1);
-    }
-
-    // 写入这一帧的四个角度
-    servoWrite('b', recordData[i].b);
-    servoWrite('f', recordData[i].f);
-    servoWrite('r', recordData[i].r);
-    servoWrite('c', recordData[i].c);
-  }
-
-  Serial.println("播放指令执行结束");
-  printStatus();
 }
 
 // 启动播放：只检查和安排第一步
 void playStart() {
   if (recording) {
-    Serial.println("请先停止录制");
+    Serial.println(F("请先停止录制"));
     return;
   }
 
   if (frameCount < 2) {
-    Serial.println("没有足够的录制数据");
+    Serial.println(F("没有足够的录制数据"));
     return;
   }
 
   if (playStage != 0) {
-    Serial.println("正在播放，请等待");
+    Serial.println(F("正在播放，请等待"));
     return;
   }
 
@@ -376,7 +372,7 @@ void playStart() {
       fPos != recordData[0].f ||
       rPos != recordData[0].r ||
       cPos != recordData[0].c) {
-    Serial.println("正在返回录制起点");
+    Serial.println(F("正在返回录制起点"));
     playStage = 1;
     returnStep = 0;
     startJointTarget(recordData[0].b, fPos, rPos, cPos);
@@ -387,7 +383,7 @@ void playStart() {
   playStage = 2;
   playIndex = 0;
   playBegin = millis();
-  Serial.println("开始播放");
+  Serial.println(F("开始播放"));
 }
 
 // 每次循环推进一小步播放流程
@@ -419,7 +415,7 @@ void playCtrl() {
     playStage = 2;
     playIndex = 0;
       playBegin = millis();
-    Serial.println("开始播放");
+    Serial.println(F("开始播放"));
     return;
   }
 
@@ -428,13 +424,14 @@ void playCtrl() {
     // 所有帧都播完
     if (playIndex >= frameCount) {
       playStage = 0;
-      Serial.println("播放指令执行结束");
+      Serial.println(F("播放指令执行结束"));
       printStatus();
       return;
     }
 
     // 还没到这一帧的时刻，等下一轮
-    if (millis() - playBegin < recordData[playIndex].timeMs) {
+    // 第 i 帧的时刻 = i * recordStep，不再从帧里读时间戳
+    if (millis() - playBegin < (unsigned long)playIndex * recordStep) {
       return;
     }
 
@@ -452,7 +449,7 @@ void playCtrl() {
 void startJointTarget(int bTarget, int fTarget, int rTarget,int cTarget) {
   // 忙碌时不接受新的运动目标
   if (motionState != 0) {
-    Serial.println("正在运动，请等待");
+    Serial.println(F("正在运动，请等待"));
     return;
   }
 
@@ -461,7 +458,7 @@ void startJointTarget(int bTarget, int fTarget, int rTarget,int cTarget) {
       fTarget < fMin || fTarget > fMax ||
       rTarget < rMin || rTarget > rMax ||
       cTarget < cMin || cTarget > cMax) {
-    Serial.println("目标角度超出范围");
+    Serial.println(F("目标角度超出范围"));
     return;
   }
 
@@ -473,7 +470,7 @@ void startJointTarget(int bTarget, int fTarget, int rTarget,int cTarget) {
   lastMotionStep = millis();
   motionState = 1;
 
-  Serial.println("开始自动运动");
+  Serial.println(F("开始自动运动"));
 }
 
 // 每次调用，最多让三个关节各向目标靠近 1 度
@@ -488,7 +485,7 @@ void stepJointTarget() {
     motionState = 0;
     // 单独运动时输出；连续流程由各自的控制函数输出完成提示
     if (homeStep == 0 && actionStep == 0) {
-      Serial.println("自动运动结束");
+      Serial.println(F("自动运动结束"));
       printStatus();
     }
     return;
@@ -548,63 +545,6 @@ void moveJoint(char name, int data) {
       break;
     default:
       break;
-  }
-}
-
-// 让指定舵机逐度运行到目标角度，DSD 决定运行速度
-void moveTo(char name, int target) {
-  int now = 0;
-  int minValue = 0;
-  int maxValue = 180;
-
-  switch (name) {
-    case 'b':
-      now = bPos;
-      minValue = bMin;
-      maxValue = bMax;
-      break;
-    case 'f':
-      now = fPos;
-      minValue = fMin;
-      maxValue = fMax;
-      break;
-    case 'r':
-      now = rPos;
-      minValue = rMin;
-      maxValue = rMax;
-      break;
-    case 'c':
-      now = cPos;
-      minValue = cMin;
-      maxValue = cMax;
-      break;
-    default:
-      return;
-  }
-
-  target = limitData(target, minValue, maxValue);
-
-  while (now != target) {
-    if (now < target) now++;
-    else now--;
-    servoWrite(name, now);
-    delay(DSD);
-  }
-}
-
-// 让前臂和后臂逐度运行到目标角度，底座和夹爪保持不动
-void moveArm(int fTarget, int rTarget) {
-  fTarget = limitData(fTarget, fMin, fMax);
-  rTarget = limitData(rTarget, rMin, rMax);
-
-  while (fPos != fTarget || rPos != rTarget) {
-    if (fPos < fTarget) servoWrite('f', fPos + 1);
-    else if (fPos > fTarget) servoWrite('f', fPos - 1);
-
-    if (rPos < rTarget) servoWrite('r', rPos + 1);
-    else if (rPos > rTarget) servoWrite('r', rPos - 1);
-
-    delay(DSD);
   }
 }
 
@@ -677,13 +617,13 @@ void startActionStep() {
     actionStep = 0;
     actionWaiting = 0;
     lastJoyStep = millis();
-    Serial.println("取放步骤启动失败，流程已停止");
+    Serial.println(F("取放步骤启动失败，流程已停止"));
   }
 }
 // 保存本次动作数据，启动第一步
 void doAction(ActionData data) {
   if (motionState != 0 || homeStep != 0 || actionStep != 0 || playStage != 0) {
-    Serial.println("正在运动，请等待");
+    Serial.println(F("正在运动，请等待"));
     return;
   }
 
@@ -723,7 +663,7 @@ void actionCtrl() {
     actionStep = 0;
     lastJoyStep = millis();
 
-    Serial.println("取放动作执行结束");
+    Serial.println(F("取放动作执行结束"));
     printStatus();
     return;
   }
@@ -740,19 +680,19 @@ char nextObject = 'A';
 void nextAction() {
   switch (nextObject) {
     case 'A':
-      Serial.println("按键1选择A");
+      Serial.println(F("按键1选择A"));
       // doAction(actionA); // 待A完成标定后启用
       nextObject = 'B';
       break;
 
     case 'B':
-      Serial.println("按键1选择B");
+      Serial.println(F("按键1选择B"));
       // doAction(actionB); // 待B完成标定后启用
       nextObject = 'C';
       break;
 
     case 'C':
-      Serial.println("按键1选择C");
+      Serial.println(F("按键1选择C"));
       // doAction(actionC); // 待C完成标定后启用
       nextObject = 'A';
       break;
@@ -763,14 +703,14 @@ void nextAction() {
 void goHome() {
   // 防止正在运动时重复启动回中
   if (motionState != 0 || homeStep != 0 || actionStep != 0) {
-    Serial.println("正在运动，请等待");
+    Serial.println(F("正在运动，请等待"));
     return;
   }
 
   homeStep = 1;
   homeWaiting = 0;
 
-  Serial.println("开始回中");
+  Serial.println(F("开始回中"));
 
   // 第一步：大小臂直接回中，底座和夹爪保持不动
   startJointTarget(bPos, fHome, rHome, cPos);
@@ -819,7 +759,7 @@ void homeCtrl() {
       homeStep = 0;
       lastJoyStep = millis();
 
-      Serial.println("回中指令执行结束");
+      Serial.println(F("回中指令执行结束"));
       printStatus();
       break;
   }
@@ -858,7 +798,7 @@ void armDataCmd(char name) {
       name != 'P' &&
       name != 'H' &&
       name != 'L') {
-    Serial.println("正在自动运动，暂不接受此指令");
+    Serial.println(F("正在自动运动，暂不接受此指令"));
     return;
   }
   switch (name) {
@@ -877,29 +817,29 @@ void armDataCmd(char name) {
     case 'H':
       DSD = DSD - DSDstep;
       if (DSD < DSDmin) DSD = DSDmin;
-      Serial.print("提高速度，DSD=");
+      Serial.print(F("提高速度，DSD="));
       Serial.println(DSD);
       break;
 
     case 'L':
       DSD = DSD + DSDstep;
       if (DSD > DSDmax) DSD = DSDmax;
-      Serial.print("降低速度，DSD=");
+      Serial.print(F("降低速度，DSD="));
       Serial.println(DSD);
       break;
       
     case 'A':
-      Serial.println("开始执行A");
+      Serial.println(F("开始执行A"));
       doAction(actionA);
       break;
 
     case 'B':
-      Serial.println("开始执行B");
+      Serial.println(F("开始执行B"));
       doAction(actionB);
       break;
 
     case 'C':
-      Serial.println("开始执行C");
+      Serial.println(F("开始执行C"));
       doAction(actionC);
       break;
 
@@ -919,8 +859,12 @@ void armDataCmd(char name) {
       playStart();
       break;
 
+    case 'K':
+      kinematicsTest();
+      break;
+
     default:
-      Serial.println("无法识别指令");
+      Serial.println(F("无法识别指令"));
       break;
   }
 }
@@ -928,7 +872,7 @@ void armDataCmd(char name) {
 // 解析三个舵机的目标角度，启动非阻塞运动
 void armXYZCmd() {
   if (homeStep != 0 || actionStep != 0) {
-    Serial.println("正在执行自动流程，暂不接受角度指令");
+    Serial.println(F("正在执行自动流程，暂不接受角度指令"));
     return;
   }
   int x, y, z;
@@ -943,7 +887,7 @@ void armXYZCmd() {
   if (count == 3) {
     startJointTarget(x, y, z, cPos);
   } else {
-    Serial.println("指令格式错误");
+    Serial.println(F("指令格式错误"));
   }
 }
 
@@ -956,7 +900,7 @@ void readCmd() {
         serialLine[lineLength] = '\0';
         armXYZCmd();
       } else if (lineLength == 40) {
-        Serial.println("指令太长");
+        Serial.println(F("指令太长"));
       }
       lineLength = 0;
     } else {
@@ -965,7 +909,8 @@ void readCmd() {
 
       if (name == 'O' || name == 'S' || name == 'H' || name == 'L' || 
           name == 'P' || name == 'A' || name == 'B' || name == 'C' || 
-          name == 'M' || name == 'N' || name == 'R' || name == 'T') {
+          name == 'M' || name == 'N' || name == 'R' || name == 'T' ||
+          name == 'K') {
         armDataCmd(data);
       } else if (lineLength < 39) {
         serialLine[lineLength] = data;
@@ -984,6 +929,72 @@ void readCmd() {
 //   }
 // }
 
+// ==================== 运动学自检：往返测试 ====================
+// 原理：正解和逆解互为逆运算。
+// 取一组角度 -> 正解算坐标 -> 逆解算回角度 -> 应该等于原来那组
+void kinematicsTest() {
+  // 三组测试角度，都在可达范围内
+  float testTheta[3] = {  0.0, 30.0,  0.0};
+  float testAlpha[3] = { 60.0, 60.0, 90.0};
+  float testBeta[3]  = {-20.0,-20.0,-60.0};
+
+  Serial.println(F("===== 运动学往返测试 ====="));
+
+  for (int i = 0; i < 3; i++) {
+    float X = 0.0;
+    float Y = 0.0;
+    float Z = 0.0;
+
+    // 正解
+    forwardKinematics(testTheta[i], testAlpha[i], testBeta[i], X, Y, Z);
+
+    // 逆解
+    float theta2 = 0.0;
+    float alpha2 = 0.0;
+    float beta2  = 0.0;
+    bool ok = inverseKinematics(X, Y, Z, theta2, alpha2, beta2);
+
+    Serial.print(F("第"));
+    Serial.print(i + 1);
+    Serial.println(F("组"));
+
+    Serial.print(F("  输入角度  theta="));
+    Serial.print(testTheta[i], 2);
+    Serial.print(F("  alpha="));
+    Serial.print(testAlpha[i], 2);
+    Serial.print(F("  beta="));
+    Serial.println(testBeta[i], 2);
+
+    Serial.print(F("  正解坐标  X="));
+    Serial.print(X, 2);
+    Serial.print(F("  Y="));
+    Serial.print(Y, 2);
+    Serial.print(F("  Z="));
+    Serial.println(Z, 2);
+
+    if (!ok) {
+      Serial.println(F("  逆解失败：目标不可达"));
+      continue;
+    }
+
+    Serial.print(F("  逆解角度  theta="));
+    Serial.print(theta2, 2);
+    Serial.print(F("  alpha="));
+    Serial.print(alpha2, 2);
+    Serial.print(F("  beta="));
+    Serial.println(beta2, 2);
+
+    Serial.print(F("  误差      theta="));
+    Serial.print(theta2 - testTheta[i], 3);
+    Serial.print(F("  alpha="));
+    Serial.print(alpha2 - testAlpha[i], 3);
+    Serial.print(F("  beta="));
+    Serial.println(beta2 - testBeta[i], 3);
+  }
+
+  Serial.println(F("===== 测试结束 ====="));
+}
+
 void setup() {
   // 初始化电机对应 PWM 针脚
   base.attach(bPin);
@@ -997,7 +1008,7 @@ void setup() {
 
   // 初始化串口
   Serial.begin(9600);
-  Serial.println("欢迎使用");
+  Serial.println(F("欢迎使用"));
 
   // 机械臂上电先回到设定的初始角度
   servoWrite('b', bPos);
