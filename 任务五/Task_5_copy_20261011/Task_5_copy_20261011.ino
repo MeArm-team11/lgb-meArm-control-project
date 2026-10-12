@@ -60,13 +60,13 @@ const int cClose = cMax;
 int bPos = 90;
 int fPos = 90;
 int rPos = 90;
-int cPos = 80;
+int cPos = cMax;
 
 // 上电初始角度，也是任务三的回中目标
 const int bHome = 90;
 const int fHome = 90;
 const int rHome = 90;
-const int cHome = 80;
+const int cHome = cMax;
 
 //摇杆参数
 const int joyCenter = 512; // 摇杆中心值
@@ -87,7 +87,7 @@ int motionState = 0;  // 0：没有自动运动；1：正在自动运动
 int targetB = 90;  // 底座的目标角度
 int targetF = 90;  // 前臂舵机的目标角度
 int targetR = 90;  // 后臂舵机的目标角度
-int targetC = 80;  // 夹爪的目标角度
+int targetC = cMax;  // 夹爪的目标角度
 // 上一次自动运动步进的时间，单位：毫秒
 unsigned long lastMotionStep = 0;
 unsigned long lastJoyStep = 0;  // 上一次处理摇杆的时间
@@ -160,22 +160,22 @@ int rHigh = 85;
 ActionData actionA = {
   {90, 90, 90}, // 取物点：底座、前臂、后臂
   {90, 90, 90}, // 放置点：底座、前臂、后臂
-  5,           // 夹爪张开角度
-  90           // 夹爪夹紧角度
+  cOpen,           // 夹爪张开角度
+  cClose           // 夹爪夹紧角度
 };
 
 ActionData actionB = {
   {90, 90, 90},
   {90, 90, 90},
-  5,
-  90
+  cOpen,
+  cClose 
 };
 
 ActionData actionC = {
   {90, 90, 90},
   {90, 90, 90},
-  5,
-  90
+  cOpen,
+  cClose 
 };
 
 // 暂存一整行串口指令，例如 x10,y30,z20
