@@ -1,0 +1,339 @@
+/*
+  按键控制板程序 · Arduino Uno R3 + IIC OLED（0.96" 128x64）
+  ==================================================================
+  这块板只做三件事，机械臂的动作全部由机械臂端完成：
+    1. 扫描 8 个按键，做软件去抖
+    2. 在"按下"的瞬间通过软串口发 1 个字符给机械臂（长按不重复发，松开不发）
+    3. 把绘图模式、示教点数、运行状态、最近发的字符显示在 OLED 上
+  ------------------------------------------------------------------
+  任务三（D4~D7），四个字符机械臂端都已实现，按了就有动作：
+    D4 → 'N'  循环执行 A/B/C 夹取放置
+    D5 → 'R'  开始 / 停止录制
+    D6 → 'T'  回放上次录制的动作
+    D7 → 'M'  回到初始姿态
+
+  任务五（D8~D11），绘图用的四键：
+    D8  → 'F'  绘图模式循环切换，OLED 第一行显示当前模式：
+               LINE → LETTER → 5PT POLY → 5PT CURVE → 回到 LINE
+               为什么"五点"占两档：子任务4（折线）和子任务5（曲线）共用
+               同一组 5 个点，而提交要求里两种画法都要完整演示，
+               所以挂在同一组点上、按 F 一键切换最省事。
+               字母具体画哪一个（N / 三角形 / Z / V）在机械臂端写死；
+               要现场换就把 LETTER 拆成四个档（加几行）。
+    D9  → 'D'  开始 / 暂停 / 继续（同一个字符，机械臂端按状态区分语义）
+    D10 → 'I'  记录当前示教点（记满 5 点后再按 = 清空重记）
+    D11 → 'Q'  取消并回中（放最边上，因为它误触的代价最大）
+
+  ------------------------------------------------------------------
+  机械臂端要配合的四条语义（按键板管不着，但必须说清楚）
+  ------------------------------------------------------------------
+    'F' 切模式  不清空示教点。折线和曲线共用同一组 5 个点，
+                同一组点先画折线、再切曲线画一遍，是最划算的演示；
+                绘制进行中收到的 F 必须被忽略（不能画到一半换模式）
+    'D' 开始    待机 → 先回待机位，再按顺序自动绘制（任务书明文要求）
+                绘制中 → 暂停；暂停中 → 继续
+    'I' 记点    点数不足 5 时记一个点；已满 5 时清空并从第 1 点重新开始
+    'Q' 取消    终止当前动作并回待机位，**示教点保留**（不要顺手清空，
+                否则演示中途取消一次就得重新摇 5 个点）
+  ------------------------------------------------------------------
+  引脚占用
+  ------------------------------------------------------------------
+    D2/D3   软串口（与机械臂通信）
+    D4-D11  8 个按键（内部上拉，另一端接 GND，不用外接电阻）
+    A4/A5   OLED 的 SDA/SCL
+    D0/D1   硬件串口，留给电脑调试（115200）
+*/
+
+#include <SoftwareSerial.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ==================== 引脚定义 ====================
+// 按键：一端接引脚，一端接 GND，用内部上拉
+// 所以松开读到 HIGH，按下读到 LOW
+const uint8_t PIN_BTN1 = 4;    // 任务三 按键1
+const uint8_t PIN_BTN2 = 5;    // 任务三 按键2
+const uint8_t PIN_BTN3 = 6;    // 任务三 按键3
+const uint8_t PIN_BTN4 = 7;    // 任务三 按键4
+const uint8_t PIN_BTN5 = 8;    // 任务五 F 模式
+const uint8_t PIN_BTN6 = 9;    // 任务五 D 开始/暂停/继续
+const uint8_t PIN_BTN7 = 10;   // 任务五 I 记录示教点
+const uint8_t PIN_BTN8 = 11;   // 任务五 Q 取消并回中
+
+// 与机械臂通信的软串口：RX, TX
+// 本程序只发送，RX 可以不接
+// 对应机械臂端另开的软串口 btnSerial(12, 13)
+const uint8_t PIN_ARM_RX = 2;
+const uint8_t PIN_ARM_TX = 3;
+SoftwareSerial armSerial(PIN_ARM_RX, PIN_ARM_TX);
+
+// ==================== 参数 ====================
+const long ARM_BAUD = 9600;    // 与机械臂端 btnSerial.begin(9600) 一致
+const long DBG_BAUD = 115200;  // USB 调试口波特率
+
+// 去抖时间：机械按键抖动一般 5~20ms，取 30ms 留余量
+const unsigned long DEBOUNCE_MS = 30;
+
+// 发完字符后短暂停顿，避免机械臂端一个字符还没读完就连发下一个
+const unsigned long SEND_GAP_MS = 20;
+
+// 示教点目标个数（任务书要求五点示教）
+const uint8_t POINT_TARGET = 5;
+
+// ==================== OLED ====================
+// 0x3C 是绝大多数 0.96 寸模块的地址；模块背面 A0 焊盘短接的会变成 0x3D
+const uint8_t OLED_ADDR = 0x3C;
+const uint8_t SCREEN_W = 128;
+const uint8_t SCREEN_H = 64;
+
+// 第 3 个参数 &Wire 表示用硬件 I2C（Uno 上是 A4/A5）
+// 第 4 个参数 -1 表示复位脚共用 Arduino 的 RESET
+// 如果编译报"没有匹配的构造函数"，说明装的是 1.x 老版本库，
+// 改成 Adafruit_SSD1306 oled(SCREEN_W, SCREEN_H);
+Adafruit_SSD1306 oled(SCREEN_W, SCREEN_H, &Wire, -1);
+
+// ==================== 按键表 ====================
+// 表驱动：加一个按键只要在下面数组里加一行
+struct ButtonKey {
+  uint8_t pin;               // 引脚号
+  char    code;              // 按下时发给机械臂的字符
+  bool    armReady;          // 机械臂端是否已经实现这个字符
+  uint8_t lastRaw;           // 上次读到的原始电平
+  uint8_t stable;            // 去抖后已确认的电平
+  unsigned long lastChange;  // 原始电平上次变化的时刻
+};
+
+ButtonKey keys[] = {
+  // ---------------- 任务三：4 个功能，机械臂端都已实现 ----------------
+  { PIN_BTN1, 'N', true,  HIGH, HIGH, 0 },  // 循环执行 A/B/C 夹取放置
+  { PIN_BTN2, 'R', true,  HIGH, HIGH, 0 },  // 开始 / 停止录制
+  { PIN_BTN3, 'T', true,  HIGH, HIGH, 0 },  // 回放上次录制的动作
+  { PIN_BTN4, 'M', true,  HIGH, HIGH, 0 },  // 回到初始姿态
+
+  // ---------------- 任务五：4 个功能，四个字符都待机械臂端实现 ----------------
+  { PIN_BTN5, 'F', false, HIGH, HIGH, 0 },  // 绘图模式循环切换
+  { PIN_BTN6, 'D', false, HIGH, HIGH, 0 },  // 开始 / 暂停 / 继续
+  { PIN_BTN7, 'I', false, HIGH, HIGH, 0 },  // 记录当前示教点
+  { PIN_BTN8, 'Q', false, HIGH, HIGH, 0 },  // 取消并回中（放最边上防误触）
+};
+
+const uint8_t KEY_COUNT = sizeof(keys) / sizeof(keys[0]);
+
+// ==================== 屏幕状态 ====================
+char lastCode = 0;              // 最近一次发出的字符，0 表示还没按过
+unsigned int pressCount = 0;    // 按键累计次数，用来确认"一次按下只触发一次"
+
+// 下面三个是"本地镜像状态"：按钮板不知道机械臂的真实情况（串口是单向的），
+// 只能按"按了什么键"推出来显示在屏幕上，供现场操作员参考。
+// 要和机械臂完全一致，需要接回传线（机械臂 D13 → 本板 D2），
+// 让机械臂把它自己的状态发过来，这是下一步可以加的。
+uint8_t modeIndex = 0;          // 0=直线 1=字母 2=五点折线 3=五点曲线
+uint8_t pointCount = 0;         // 已记录示教点数
+uint8_t runState = 0;           // 0=READY 1=DRAWING 2=PAUSED
+
+const uint8_t MODE_COUNT = 4;
+
+// ==================== 画三行状态 ====================
+// 为什么显示文字都用 F("...")：
+//   Uno 只有 2KB RAM，OLED 的整屏缓冲已经吃掉 1KB，
+//   普通字符串会被复制进 RAM，F() 让它们留在 Flash 里，省内存。
+// 为什么是英文：
+//   Adafruit 内置字库只有 ASCII，直接 print 中文只会显示乱码方块。
+//   中文功能名写在面板标签和报告里，屏幕上用英文缩写。
+void drawScreen() {
+  oled.clearDisplay();
+  oled.setTextSize(1);                 // 6x8 点阵，128 宽一行能放 21 个字符
+  oled.setTextColor(SSD1306_WHITE);
+
+  // 第 1 行：当前绘图模式（现场"不得重新编译"时，这是操作员唯一的参照）
+  oled.setCursor(0, 0);
+  oled.print(F("MODE: "));
+  switch (modeIndex) {
+    case 0:  oled.print(F("LINE"));      break;  // 子任务1 直线
+    case 1:  oled.print(F("LETTER"));    break;  // 子任务2 字母 / 图形
+    case 2:  oled.print(F("5PT POLY"));  break;  // 子任务4 五点折线
+    default: oled.print(F("5PT CURVE")); break;  // 子任务5 五点平滑曲线
+  }
+
+  // 第 2 行：示教进度 + 运行状态
+  oled.setCursor(0, 22);
+  oled.print(F("PT: "));
+  oled.print(pointCount);
+  oled.print('/');
+  oled.print(POINT_TARGET);
+  oled.print(F("  "));
+  bool isTeachMode = (modeIndex >= 2);   // 只有"五点"档才谈得上点数满不满
+  if (isTeachMode && pointCount >= POINT_TARGET && runState == 0) {
+    // 记满 5 点：提示再按一下记录键就是清空重记
+    oled.print(F("FULL"));
+  } else {
+    switch (runState) {
+      case 1:  oled.print(F("DRAWING")); break;
+      case 2:  oled.print(F("PAUSED"));  break;
+      default: oled.print(F("READY"));   break;
+    }
+  }
+
+  // 第 3 行：最近发出的字符 + 按键累计次数
+  // 字符已经做到一键一符，看字符就知道是哪个功能
+  oled.setCursor(0, 44);
+  oled.print(F("TX: "));
+  if (lastCode == 0) {
+    oled.print('-');
+  } else {
+    oled.print(lastCode);
+  }
+  oled.print(F("  COUNT: "));
+  oled.print(pressCount);
+
+  // display() 是把 1024 字节整帧推给屏幕，是阻塞操作，
+  // 所以只在状态变化时调用，绝不放在 loop 里无条件刷
+  oled.display();
+}
+
+// ==================== 更新本地镜像状态 ====================
+// 只按"按了哪个键"推算，用于屏幕显示；
+// 动作是否真的执行、要不要拒绝，全部由机械臂端决定
+void updateLocalState(char code) {
+  switch (code) {
+    case 'F':
+      // 切模式不清空示教点：折线和曲线共用同一组 5 个点
+      modeIndex = (modeIndex + 1) % MODE_COUNT;
+      break;
+
+    case 'I':
+      // 记满 5 点后再按一次 = 清空重记（现场记错点的唯一补救手段）
+      if (pointCount >= POINT_TARGET) {
+        pointCount = 1;
+      } else {
+        pointCount++;
+      }
+      runState = 0;
+      break;
+
+    case 'D':
+      // 开始 → 暂停 → 继续 → 暂停 …… 一个键循环
+      if (runState == 0) {
+        runState = 1;
+      } else if (runState == 1) {
+        runState = 2;
+      } else {
+        runState = 1;
+      }
+      break;
+
+    case 'Q':
+      // 取消并回中：示教点保留，不清空
+      runState = 0;
+      break;
+
+    default:
+      // 任务三的 N/R/T/M 不改变任务五的状态
+      break;
+  }
+}
+
+// ==================== 初始化 ====================
+void setup() {
+  Serial.begin(DBG_BAUD);
+  armSerial.begin(ARM_BAUD);
+
+  for (uint8_t i = 0; i < KEY_COUNT; i++) {
+    pinMode(keys[i].pin, INPUT_PULLUP);      // 内部上拉，不需要外接电阻
+    keys[i].lastRaw = digitalRead(keys[i].pin);
+    keys[i].stable = keys[i].lastRaw;
+  }
+
+  Wire.begin();
+
+  // begin() 会返回是否找到了屏幕，这个返回值一定要看：
+  // 返回 false 就是接线或地址有问题，不需要盲猜
+  bool oledOk = oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
+
+  if (oledOk) {
+    // 默认 I2C 只有 100kHz，整屏刷新要 ~90ms；提到 400kHz 只要 ~23ms。
+    // 这直接影响"短按会不会丢"，详见报告里的刷新时间说明。
+    Wire.setClock(400000);
+
+    // 上电先显示一行 System Ready，确认屏幕和主控通信正常
+    oled.clearDisplay();
+    oled.setTextSize(1);
+    oled.setTextColor(SSD1306_WHITE);
+    oled.setCursor(0, 28);
+    oled.print(F("System Ready"));
+    oled.display();
+  }
+
+  Serial.println(F("按键控制板就绪（Uno + OLED，8 键）"));
+  Serial.println(F("任务三: 1=N 2=R 3=T 4=M"));
+  Serial.println(F("任务五: 5=F 模式 / 6=D 开始暂停继续 / 7=I 记点 / 8=Q 取消回中"));
+  Serial.println(F("模式: F 键循环 LINE -> LETTER -> 5PT POLY -> 5PT CURVE"));
+  if (oledOk) {
+    Serial.println(F("OLED 初始化成功，地址 0x3C"));
+  } else {
+    Serial.println(F("OLED 初始化失败：检查 VCC/GND、SDA=A4、SCL=A5 和地址 0x3C/0x3D"));
+  }
+  Serial.println(F("提醒：F/D/I/Q 四个字符机械臂端还没实现，按了不会有反应"));
+
+  delay(1000);   // 让 System Ready 停 1 秒，能看清
+  drawScreen();  // 之后进入正常的三行状态显示
+}
+
+// ==================== 按键扫描 ====================
+// 返回 true 表示这个键刚刚被按下（HIGH → LOW 的瞬间，只返回一次）
+//
+// 去抖用"计时确认法"，为什么这么写：
+//   原始电平一变就先记时刻、但不改"已确认状态"，
+//   只有新电平稳定保持超过 DEBOUNCE_MS 才认可。
+//   这样抖动期间来回跳变只会不断重置计时器，永远不会被当成有效按下。
+bool keyJustPressed(ButtonKey &k) {
+  uint8_t raw = digitalRead(k.pin);
+  unsigned long now = millis();
+
+  // 原始电平变化，重新计时，暂不改变稳定状态
+  if (raw != k.lastRaw) {
+    k.lastRaw = raw;
+    k.lastChange = now;
+    return false;
+  }
+
+  // 原始电平稳定且与已确认状态不同，才更新已确认状态
+  if (raw != k.stable && (now - k.lastChange) >= DEBOUNCE_MS) {
+    k.stable = raw;
+    // 只有按下（LOW）才触发发送，松开不发送，
+    // 所以长按不会重复发（状态没变，不会再进这个分支）
+    return (k.stable == LOW);
+  }
+
+  return false;
+}
+
+// ==================== 主循环 ====================
+void loop() {
+  for (uint8_t i = 0; i < KEY_COUNT; i++) {
+    if (keyJustPressed(keys[i])) {
+      // 顺序很重要：先发字符，再刷屏幕。
+      // 软串口发送时会短暂关中断，屏幕刷新是长阻塞操作，两件事不重叠。
+      armSerial.write(keys[i].code);
+
+      lastCode = keys[i].code;
+      pressCount++;
+      updateLocalState(keys[i].code);
+      drawScreen();     // 只在按键事件后刷新，平时不刷
+
+      // 本地回显，用串口监视器确认按下事件确实只发了一次
+      Serial.print(F("按键"));
+      Serial.print(i + 1);
+      Serial.print(F(" 已按下，发送 "));
+      Serial.print(keys[i].code);
+      if (keys[i].armReady) {
+        Serial.println();
+      } else {
+        Serial.println(F("  （机械臂端还没实现这个字符）"));
+      }
+
+      delay(SEND_GAP_MS);
+    }
+  }
+}
