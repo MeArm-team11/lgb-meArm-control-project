@@ -33,6 +33,9 @@ meArm-control-project/
 │   └── task5_drawing/
 │       ├── task5_drawing.ino           完整工程（FK/IK、录制回放、回中、取放）
 │       └── types.h                     数据结构定义
+├── button_panel/                       按键控制板（独立一块 Uno R3）
+│   ├── button_panel.ino                8 键扫描 + 去抖 + 串口发送 + OLED 状态显示
+│   └── i2c_scan/i2c_scan.ino           I2C 地址扫描工具（调试 OLED 用）
 ├── debug/                             早期舵机角度极限调试
 │   ├── arm_test/arm_test.ino
 │   └── 用于调试机械臂的转动角度.md
@@ -48,7 +51,9 @@ meArm-control-project/
 
 1. 用 Arduino IDE 打开对应任务的 `.ino`（任务五需连同同目录 `types.h`），按实际板型选择开发板与端口。
 2. 机械臂板烧录任务代码，硬件串口波特率 **9600**。
-3. 按键板程序单独烧录到控制板，USB 调试口波特率 **115200**。
+3. 按键板程序 `button_panel/button_panel.ino` 单独烧录到控制板，USB 调试口波特率 **115200**。
+   该程序需要 **Adafruit SSD1306** 库（在库管理器中安装时会自动带上 Adafruit GFX）。
+   烧录前若不确定 OLED 的 I2C 地址，可先烧 `button_panel/i2c_scan/i2c_scan.ino` 扫描地址。
 4. 打开机械臂端串口监视器，发送单字符指令（**不带回车换行**）或角度指令（`x,y,z` 形式**需要回车或换行**结束）。
 
 > 注意：单字符指令在字符到达时立即执行；若串口监视器自动补发换行，会额外触发一次空行解析并打印"指令格式错误"。发送单字符时请关闭行尾符。
