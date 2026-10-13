@@ -12,10 +12,30 @@
   | B | 执行 B 组取放动作 |
   | C | 执行 C 组取放动作 |
   | M | 机械臂回中 |
-  | N | 依次选择 A、B、C（目前只输出提示，不执行动作） |
+  | N | 依次选择 A、B、C 并执行取放 |
   | R | 开始或停止录制动作 |
   | T | 回放录制动作 |
+  | K | 正逆运动学往返自检 |
   发送 x90,y60,z100 并以回车或换行结束，可分别设置底座、前臂、后臂的目标角度。
+
+按键控制板（Uno R3 + IIC OLED，8 键）信号：
+  | 按键 | 引脚 | 字符 | 功能 |
+  | 1 | D4  | N | 循环执行 A/B/C 夹取放置 |
+  | 2 | D5  | R | 开始 / 停止录制 |
+  | 3 | D6  | T | 回放上次录制的动作 |
+  | 4 | D7  | M | 回到初始姿态 |
+  | 5 | D8  | F | 绘图模式循环切换 |
+  | 6 | D9  | D | 开始绘制 |
+  | 7 | D10 | I | 记录当前示教点 |
+  | 8 | D11 | Q | 取消并回到初始姿态 |
+  按钮板 TX(D3) 接本板 D12(RX)，两板必须共地，波特率 9600，只发单字符。
+
+摇杆标定（任务二）：
+  用摇杆把夹爪移到目标位置后从上位机发送数字键记录当前三个关节角
+  | 1 | A 取物点 |  | 2 | A 放置点 |
+  | 3 | B 取物点 |  | 4 | B 放置点 |
+  | 5 | C 取物点 |  | 6 | C 放置点 |
+  标定数据存在 SRAM，掉电或复位后需要重新标定。
 
 接线：
   底座舵机 D9，前臂舵机 D8，后臂舵机 D6，夹爪舵机 D7。
@@ -26,14 +46,28 @@ x,y,z 指令以回车或换行结束。
 DSD 是每移动 1 度后的等待时间，DSD 越小，运行越快。
 
 使用前应核对舵机转向、机械限位和夹爪开合角度。
+
+还未实现功能：
+  1. 绘制过程中的暂停 / 继续（任务五子任务 3）
+  2. 按 F 切换后的绘图模式只改变显示名称，尚未按模式绘制不同轨迹
+  3. 平滑曲线的插值算法（任务五子任务 5）
 */
 
 #include <Servo.h>
 #include <stdio.h>
+#include <SoftwareSerial.h>
 #include "types.h"
 
 // b底座，f前臂，r后臂，c夹爪
 Servo base, fArm, rArm, claw;
+
+// ==================== 按钮板通信 ====================
+// 按钮板（Uno R3 + IIC OLED，8 键）通过软串口发单字符指令
+// 按钮板 TX(D3) -> 机械臂 D12(RX)
+// 与电脑用的硬件串口 D0/D1 分开，两块板烧录都不需要拔线
+const int BTN_RX = 12;
+const int BTN_TX = 13;
+SoftwareSerial btnSerial(BTN_RX, BTN_TX);
 
 // 结构体定义已移至 types.h
 
@@ -256,6 +290,125 @@ ActionData actionC = {
   cOpen,
   cClose 
 };
+
+// ==================== 任务二：摇杆标定 ====================
+// 操作流程：用摇杆把夹爪移到目标位置 -> 从上位机发一个数字键记录当前角度
+//   1 = A 取物点   2 = A 放置点
+//   3 = B 取物点   4 = B 放置点
+//   5 = C 取物点   6 = C 放置点
+// 注意：标定数据存在 SRAM，掉电或复位后回到默认值，需要重新标定
+bool actionReady[3] = {false, false, false};
+
+// 把三个动作数据放进数组，标定时按下标访问
+ActionData* actionList[3] = {&actionA, &actionB, &actionC};
+
+// 记录当前姿态到指定物体的指定点
+// objIndex: 0=A 1=B 2=C    isGetPoint: true=取物点 false=放置点
+void calibratePoint(int objIndex, bool isGetPoint) {
+  JointPoint* p;
+
+  if (isGetPoint) {
+    p = &actionList[objIndex]->getPoint;
+  } else {
+    p = &actionList[objIndex]->putPoint;
+  }
+
+  // 记录的当前舵机设定角度，就是标定结果
+  p->b = bPos;
+  p->f = fPos;
+  p->r = rPos;
+
+  actionReady[objIndex] = true;
+
+  Serial.print(F("标定 OK: "));
+  Serial.print((char)('A' + objIndex));
+  Serial.print(isGetPoint ? F(" 取物点") : F(" 放置点"));
+  Serial.print(F("  b="));
+  Serial.print(p->b);
+  Serial.print(F(" f="));
+  Serial.print(p->f);
+  Serial.print(F(" r="));
+  Serial.println(p->r);
+}
+
+// ==================== 任务五：五点示教 ====================
+// 记录的是关节角而不是末端坐标，所以回放不需要逆解，
+// 段与段之间在关节空间插值，能保证笔尖高度基本不变
+const int teachMax = 5;
+JointPoint teachPoint[teachMax];   // 5 个示教点
+int teachCount = 0;                // 已记录几个点
+int drawMode = 0;                  // 0=直线基础档 1=字母档 2=五点折线 3=五点曲线
+
+// 绘制流程的状态
+int drawActing = 0;   // 0=空闲；1=正在回起点；2=正在绘制
+int drawStage = 0;    // 回起点的三个子步骤：1 抬臂 2 转底座 3 落下
+int drawIndex = 0;    // 当前正在走向第几个示教点
+unsigned long drawWaitStart = 0;   // 子步骤之间的停顿计时
+
+// 显示和日志用的模式名
+const char* modeName(int m) {
+  switch (m) {
+    case 0:  return "LINE";
+    case 1:  return "LETTER";
+    case 2:  return "5PT POLY";
+    default: return "5PT CURVE";
+  }
+}
+
+// 记录当前姿态为一个示教点
+// 已满 5 点时再按 = 清空并从第 1 点重新开始（现场记错点的补救手段）
+void teachRecordPoint() {
+  if (teachCount >= teachMax) {
+    teachCount = 1;
+    Serial.println(F("示教点已满，清空重记：现在记的是第 1 点"));
+  } else {
+    teachCount++;
+  }
+
+  teachPoint[teachCount - 1].b = bPos;
+  teachPoint[teachCount - 1].f = fPos;
+  teachPoint[teachCount - 1].r = rPos;
+
+  Serial.print(F("记录示教点 "));
+  Serial.print(teachCount);
+  Serial.print(F("/"));
+  Serial.print(teachMax);
+  Serial.print(F("  b="));
+  Serial.print(bPos);
+  Serial.print(F(" f="));
+  Serial.print(fPos);
+  Serial.print(F(" r="));
+  Serial.println(rPos);
+}
+
+// 启动绘制：先回待机位，再按顺序走示教点
+void drawStart() {
+  if (teachCount < 2) {
+    Serial.print(F("示教点不足，当前 "));
+    Serial.print(teachCount);
+    Serial.println(F(" 个（至少需要 2 个）"));
+    return;
+  }
+
+  Serial.print(F("开始绘制，模式 "));
+  Serial.print(modeName(drawMode));
+  Serial.print(F("，共 "));
+  Serial.print(teachCount);
+  Serial.println(F(" 个点"));
+
+  // 绘制动作尚未实现，先把已记录的示教点打印出来做校验
+  for (int i = 0; i < teachCount; i++) {
+    Serial.print(F("  点"));
+    Serial.print(i + 1);
+    Serial.print(F(": b="));
+    Serial.print(teachPoint[i].b);
+    Serial.print(F(" f="));
+    Serial.print(teachPoint[i].f);
+    Serial.print(F(" r="));
+    Serial.println(teachPoint[i].r);
+  }
+  Serial.println(F("（绘制功能待实现，详见说明文档）"));
+}
 
 // 暂存一整行串口指令，例如 x10,y30,z20
 char serialLine[40];
@@ -676,24 +829,24 @@ void actionCtrl() {
 // 下次按键1要执行的物体
 char nextObject = 'A';
 
-// 每调用一次，依次选择 A、B、C
+// 每调用一次，依次选择 A、B、C，并执行对应的取放动作
 void nextAction() {
   switch (nextObject) {
     case 'A':
       Serial.println(F("按键1选择A"));
-      // doAction(actionA); // 待A完成标定后启用
+      doAction(actionA);
       nextObject = 'B';
       break;
 
     case 'B':
       Serial.println(F("按键1选择B"));
-      // doAction(actionB); // 待B完成标定后启用
+      doAction(actionB);
       nextObject = 'C';
       break;
 
     case 'C':
       Serial.println(F("按键1选择C"));
-      // doAction(actionC); // 待C完成标定后启用
+      doAction(actionC);
       nextObject = 'A';
       break;
   }
@@ -843,25 +996,35 @@ void armDataCmd(char name) {
       doAction(actionC);
       break;
 
-    case 'M':
-      goHome();
-      break;
-
-    case 'N':
-      nextAction();
-      break;
-
-    case 'R':
-      recordCmd();
-      break;
-    
-    case 'T':
-      playStart();
-      break;
-
     case 'K':
       kinematicsTest();
       break;
+
+    // ===== 任务二：摇杆标定（用摇杆摆好位置后发送数字键）=====
+    case '1': calibratePoint(0, true);  break;  // A 取物点
+    case '2': calibratePoint(0, false); break;  // A 放置点
+    case '3': calibratePoint(1, true);  break;  // B 取物点
+    case '4': calibratePoint(1, false); break;  // B 放置点
+    case '5': calibratePoint(2, true);  break;  // C 取物点
+    case '6': calibratePoint(2, false); break;  // C 放置点
+
+    // ===== 按钮板按键 1~4 =====
+    case 'N': nextAction();   break;  // 按键1：依次选择 A、B、C 并执行取放
+    case 'R': recordCmd();    break;  // 按键2：开始 / 停止录制
+    case 'T': playStart();    break;  // 按键3：回放上次录制的动作
+    case 'M': goHome();       break;  // 按键4：回到初始姿态
+
+    // ===== 按钮板按键 5~8 =====
+    case 'F':                 // 按键5：绘图模式切换 LINE/LETTER/5PT POLY/5PT CURVE
+      // 切换模式不清空示教点：折线和曲线共用同一组 5 个点
+      drawMode = (drawMode + 1) % 4;
+      Serial.print(F("绘图模式: "));
+      Serial.println(modeName(drawMode));
+      break;
+
+    case 'D': drawStart();        break;  // 按键6：开始绘制
+    case 'I': teachRecordPoint(); break;  // 按键7：记录当前示教点
+    case 'Q': goHome();           break;  // 按键8：取消并回到初始姿态（示教点保留）
 
     default:
       Serial.println(F("无法识别指令"));
@@ -907,10 +1070,15 @@ void readCmd() {
       char name = data;
       if (name >= 'a' && name <= 'z') name = name - 'a' + 'A';
 
-      if (name == 'O' || name == 'S' || name == 'H' || name == 'L' || 
+      // 数字 1~6 是任务二的摇杆标定键，要在"坐标指令缓冲区"之前拦下来，
+      // 否则会被当成坐标指令的字符塞进 serialLine
+      if (name >= '1' && name <= '6') {
+        armDataCmd(name);
+      } else if (name == 'O' || name == 'S' || name == 'H' || name == 'L' || 
           name == 'P' || name == 'A' || name == 'B' || name == 'C' || 
           name == 'M' || name == 'N' || name == 'R' || name == 'T' ||
-          name == 'K') {
+          name == 'K' ||
+          name == 'F' || name == 'D' || name == 'I' || name == 'Q') {
         armDataCmd(data);
       } else if (lineLength < 39) {
         serialLine[lineLength] = data;
@@ -919,6 +1087,25 @@ void readCmd() {
         lineLength = 40;
       }
     }
+  }
+}
+
+// 读取按钮板通过软串口发来的单字符指令
+// 按钮板一次只发一个字符，不带回车换行，所以收到就直接执行
+void readBtnCmd() {
+  while (btnSerial.available() > 0) {
+    char data = btnSerial.read();
+
+    // 忽略换行、回车等空白字符，避免按钮板误发时触发"无法识别指令"
+    if (data == '\r' || data == '\n') continue;
+
+    char name = data;
+    if (name >= 'a' && name <= 'z') name = name - 'a' + 'A';
+
+    Serial.print(F("[按钮板] "));
+    Serial.println(name);
+
+    armDataCmd(name);
   }
 }
 // 读取上位机发送的单字符指令
@@ -1010,6 +1197,10 @@ void setup() {
   Serial.begin(9600);
   Serial.println(F("欢迎使用"));
 
+  // 初始化与按钮板通信的软串口
+  btnSerial.begin(9600);
+  Serial.println(F("按钮板串口就绪: RX=D12 TX=D13"));
+
   // 机械臂上电先回到设定的初始角度
   servoWrite('b', bPos);
   servoWrite('f', fPos);
@@ -1018,7 +1209,8 @@ void setup() {
 }
 
 void loop() {
-  readCmd();
+  readCmd();       // 电脑（硬件串口）
+  readBtnCmd();    // 按钮板（软串口）
   stepJointTarget();
   homeCtrl();
   actionCtrl();
