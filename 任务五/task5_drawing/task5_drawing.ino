@@ -37,6 +37,36 @@
   | 5 | C 取物点 |  | 6 | C 放置点 |
   标定数据存在 SRAM，掉电或复位后需要重新标定。
 
+任务二取放流程（startActionStep，共 14 步）：
+   1  抬臂到安全姿态          f=120, r=85
+   2  张开夹爪                c=5
+   3  底座转向取物点          只动底座
+   4  到"取物点正上方"的接近姿态  f = 取物点.f - approachLift
+   5  【垂直下降】到取物点      只动大臂
+   6  夹紧物体
+   7  【垂直抬大臂】提离桌面    只动大臂
+   8  【收小臂】               f=fFold, r=rFold
+   9  底座转向放置点          只动底座
+  10  到"放置点正上方"的接近姿态
+  11  【垂直下降】到放置点      只动大臂
+  12  张开夹爪，放下物体
+  13  【垂直抬大臂】离开物体    只动大臂
+  14  【收小臂】回到安全姿态
+
+  三个关键设计：
+    1) 先抬臂再转底座：手臂低位回转会横扫桌面和其他物体，
+       先抬到安全姿态再转，旋转路径才安全。
+    2) 接近姿态 + 垂直下降：第 4、10 步先把夹爪停在目标点正上方，
+       第 5、11 步只动大臂垂直落下。若从安全姿态斜着移到取物点，
+       爪尖会从斜上方扫过物体、把物体推跑（早期版本夹不住的主因）。
+    3) 夹住后先抬大臂、再收小臂：大臂每度约抬 1.4mm，抬升力臂最短、
+       对夹爪拉力最小，物体最不容易被拽掉；而且物体先垂直离桌，
+       收小臂时不会贴着桌面拖过去。放置时（13、14 步）同理。
+
+  可调量：approachLift（接近高度，默认 22 度约 30mm）、
+          liftAmount（抬大臂高度，默认 35 度约 49mm）、
+          fFold / rFold（收臂后的姿态，默认 110 / 60）。
+
 接线：
   底座舵机 D9，前臂舵机 D8，后臂舵机 D6，夹爪舵机 D7。
   底座摇杆 A0，前臂摇杆 A3，后臂摇杆 A1，夹爪摇杆 A2。
@@ -84,10 +114,10 @@ const int rJoy = A1; // r后臂摇杆
 const int cJoy = A2; // c夹爪摇杆
 
 //舵机安全角度范围，换机械臂先改这里
-const int bMin = 0;   const int bMax = 180; // b底座
-const int fMin = 0;  const int fMax = 150; // f前臂15 120
-const int rMin = 0;  const int rMax = 180; // r后臂
-const int cMin = 5;   const int cMax = 110;  // c夹爪
+const int bMin = 20;   const int bMax = 150; // b底座
+const int fMin = 28;  const int fMax = 150; // f前臂15 120
+const int rMin = 20;  const int rMax = 150; // r后臂
+const int cMin = 5;   const int cMax = 130;  // c夹爪
 
 //夹爪开合角度，实物方向相反时交换 cOpen 和 cClose
 const int cOpen = cMin;
@@ -222,7 +252,7 @@ unsigned long homeWaitStart = 0;
 // 当前正在执行的取放数据
 ActionData currentAction;
 
-// 取放流程：0 表示空闲，1~10 表示当前步骤
+// 取放流程：0 表示空闲，1~14 表示当前步骤
 int actionStep = 0;
 
 // 是否正在进行步骤之间的停顿
@@ -701,12 +731,51 @@ void moveJoint(char name, int data) {
   }
 }
 
-// 根据指定物体的数据，完成夹取和放置
-// 根据 actionStep，启动对应的一段运动
+// 接近姿态的抬升量（度）
+// 抓取前先到物体"正上方"的接近姿态，再垂直下降。
+// 大臂角度每减小 1 度，夹爪大约抬高 1.4mm（L1 = 80mm）：
+//   f = 取物点.f - 22  ->  夹爪比取物点高约 30mm
+// 这个高度要能越过物体本身和旁边的物体，又不能太高（抬得越高，
+// 抬升那一步的行程越长，物体越容易被甩出去）。
+//
+// 不能写成 const：接近姿态的角度要经过 limitData() 限幅再使用，
+// 写成 const 会让编译器在初始化时调用函数，把数据段搬到 RAM，
+// 白白占用本就紧张的 SRAM。
+int approachLift = 22;
+
+// 夹住物体之后的抬升分两步做：先抬大臂，再收小臂
+// 为什么分开：
+//   1) 大臂每减小 1 度，夹爪约抬高 1.4mm，抬升的力臂最短，
+//      对夹爪的拉力最小，物体最不容易被甩出去；
+//   2) 先让物体垂直离开桌面，再往回收小臂，
+//      物体不会贴着桌面拖过去、蹭到旁边的物体。
+// 大臂先抬的高度（度），抬到"取物点.f - 这个值"
+int liftAmount = 35;
+// 再把小臂收到这个姿态（这两步收完后回到安全姿态附近）
+int fFold = 110;
+int rFold = 60;
+
+// 取放流程：1~14 共 14 步
+// 结构参考通用取放标准做法：每个位置分"接近姿态"和"就位姿态"两次，
+// 中间靠垂直下降/上升连接，避免斜着扫过去把物体推跑。
+//   1  抬臂到安全姿态
+//   2  张开夹爪
+//   3  底座转向取物点
+//   4  大小臂到"取物点正上方"的接近姿态
+//   5  【垂直下降】到取物点（只动大臂，底座和小臂不动）
+//   6  夹紧物体
+//   7  【抬大臂】把物体垂直提离桌面
+//   8  【收小臂】把手臂收回（物体已经在高处，不会再蹭到桌面）
+//   9  底座转向放置点
+//  10  大小臂到"放置点正上方"的接近姿态
+//  11  【垂直下降】到放置点（只动大臂）
+//  12  张开夹爪，放下物体
+//  13  抬大臂，离开物体
+//  14  收小臂，回到安全姿态
 void startActionStep() {
   switch (actionStep) {
     case 1:
-      // 大小臂抬升
+      // 大小臂抬升到安全姿态
       startJointTarget(bPos, fHigh, rHigh, cPos);
       break;
 
@@ -721,44 +790,82 @@ void startActionStep() {
       break;
 
     case 4:
-      // 大小臂到达取物点
+      // 大小臂到"取物点正上方"的接近姿态
+      // 只抬大臂（f 减小 = 抬高），底座和小臂在下一步下降时保持不动
+      // 用 limitData 限幅：取物点的 f 如果接近上限，减 22 之后可能越界，
+      // 而越界的目标会被 startJointTarget 拒绝并导致整个流程中止
       startJointTarget(bPos,
-                       currentAction.getPoint.f,
+                       limitData(currentAction.getPoint.f - approachLift, fMin, fMax),
                        currentAction.getPoint.r,
                        cPos);
       break;
 
     case 5:
+      // 【垂直下降】到取物点：只动大臂
+      // 底座和小臂不动，所以夹爪在铅垂方向落下去，
+      // 不会从斜上方扫过来把物体推跑
+      startJointTarget(bPos,
+                       currentAction.getPoint.f,
+                       rPos,
+                       cPos);
+      break;
+
+    case 6:
       // 夹紧物体
       startJointTarget(bPos, fPos, rPos, currentAction.close);
       break;
 
-    case 6:
-      // 夹取后抬升
-      startJointTarget(bPos, fHigh, rHigh, cPos);
+    case 7:
+      // 【抬大臂】先把物体垂直提离桌面
+      // 只动大臂，小臂保持不动，所以是垂直提起来
+      startJointTarget(bPos,
+                       limitData(currentAction.getPoint.f - liftAmount, fMin, fMax),
+                       rPos,
+                       cPos);
       break;
 
-    case 7:
+    case 8:
+      // 【收小臂】物体已经离桌，再往回收手臂
+      startJointTarget(bPos, fFold, rFold, cPos);
+      break;
+
+    case 9:
       // 底座转向放置点
       startJointTarget(currentAction.putPoint.b, fPos, rPos, cPos);
       break;
 
-    case 8:
-      // 大小臂到达放置点
+    case 10:
+      // 大小臂到"放置点正上方"的接近姿态
       startJointTarget(bPos,
-                       currentAction.putPoint.f,
+                       limitData(currentAction.putPoint.f - approachLift, fMin, fMax),
                        currentAction.putPoint.r,
                        cPos);
       break;
 
-    case 9:
+    case 11:
+      // 【垂直下降】到放置点：只动大臂
+      startJointTarget(bPos,
+                       currentAction.putPoint.f,
+                       rPos,
+                       cPos);
+      break;
+
+    case 12:
       // 张开夹爪，放下物体
       startJointTarget(bPos, fPos, rPos, currentAction.open);
       break;
 
-    case 10:
-      // 放置后再次抬升
-      startJointTarget(bPos, fHigh, rHigh, cPos);
+    case 13:
+      // 抬大臂，离开刚放下的物体
+      startJointTarget(bPos,
+                       limitData(currentAction.putPoint.f - liftAmount, fMin, fMax),
+                       rPos,
+                       cPos);
+      break;
+
+    case 14:
+      // 收小臂，回到安全姿态
+      startJointTarget(bPos, fFold, rFold, cPos);
       break;
 
     default:
@@ -811,8 +918,8 @@ void actionCtrl() {
 
   actionWaiting = 0;
 
-  // 最后一步及停顿结束
-  if (actionStep == 10) {
+  // 最后一步及停顿结束（现在流程共 14 步）
+  if (actionStep == 14) {
     actionStep = 0;
     lastJoyStep = millis();
 
