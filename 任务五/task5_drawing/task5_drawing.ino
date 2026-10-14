@@ -67,6 +67,23 @@
           liftAmount（抬大臂高度，默认 35 度约 49mm）、
           fFold / rFold（收臂后的姿态，默认 110 / 60）。
 
+任务五画线流程（drawStart / drawCtrl）：
+  操作步骤：
+    1. 记示教点：用摇杆把笔尖移到直线起点，按 I（按键7）记一个点；
+       再移到终点，按 I 记第二个点。记满 5 点后再按 I 会清空重记。
+    2. 按 D（按键6）开始绘制。
+    3. 绘制过程中按 D 暂停，再按 D 继续；按 Q（按键8）取消并回待机。
+       串口发 U 也可以直接继续（备用）。
+  自动流程：
+    先转到底座起点角度并抬臂 -> 降到起笔点 -> 在相邻示教点之间
+    插值走线 -> 走完所有点后收笔。
+  插值方式：
+    按角度差把每一段分成若干步，底座、大臂、小臂同步按比例走。
+    因为起点和终点都是"笔尖落在纸面上"的姿态，中间按比例插值时
+    笔尖高度基本不变，所以画出来的线是连续的。
+    角度差的线性插值会让线略有弧度，一段几十毫米的线误差在几毫米以内。
+  可调量：drawStepMs（每个插值点之间的间隔，默认 15ms，越小越快）。
+
 接线：
   底座舵机 D9，前臂舵机 D8，后臂舵机 D6，夹爪舵机 D7。
   底座摇杆 A0，前臂摇杆 A3，后臂摇杆 A1，夹爪摇杆 A2。
@@ -114,9 +131,9 @@ const int rJoy = A1; // r后臂摇杆
 const int cJoy = A2; // c夹爪摇杆
 
 //舵机安全角度范围，换机械臂先改这里
-const int bMin = 20;   const int bMax = 150; // b底座
-const int fMin = 28;  const int fMax = 150; // f前臂15 120
-const int rMin = 20;  const int rMax = 150; // r后臂
+const int bMin = 10;   const int bMax = 170; // b底座
+const int fMin = 10;  const int fMax = 170; // f前臂15 120
+const int rMin = 10;  const int rMax = 170; // r后臂
 const int cMin = 5;   const int cMax = 130;  // c夹爪
 
 //夹爪开合角度，实物方向相反时交换 cOpen 和 cClose
@@ -361,27 +378,162 @@ void calibratePoint(int objIndex, bool isGetPoint) {
   Serial.println(p->r);
 }
 
-// ==================== 任务五：五点示教 ====================
-// 记录的是关节角而不是末端坐标，所以回放不需要逆解，
-// 段与段之间在关节空间插值，能保证笔尖高度基本不变
+// ==================== 任务五：示教与绘制 ====================
+// 记录的是关节角而不是末端坐标，所以绘制不需要逆解，
+// 路径上的点都在关节空间里算，笔尖高度基本不变
 const int teachMax = 5;
-JointPoint teachPoint[teachMax];   // 5 个示教点
+JointPoint teachPoint[teachMax];   // 最多 5 个示教点
 int teachCount = 0;                // 已记录几个点
-int drawMode = 0;                  // 0=直线基础档 1=字母档 2=五点折线 3=五点曲线
+
+// 绘制模式
+//   0 LINE  ：2 个点画直线（开放折线）
+//   1 TRI   ：3 个点画三角形（自动闭合，不用把第 1 点再记一遍）
+//   2 POLY  ：5 个点画折线（任务书子任务 4，开放）
+//   3 CURVE ：3~5 个点画平滑曲线（Catmull-Rom，子任务 5）
+const int MODE_LINE  = 0;
+const int MODE_TRI   = 1;
+const int MODE_POLY  = 2;
+const int MODE_CURVE = 3;
+const int MODE_COUNT = 4;
+int drawMode = MODE_LINE;
+
+// 绘制时每个路径点之间的间隔（毫秒）
+// 和取放流程用的 DSD 分开：绘制需要更密集地更新目标位置，
+// 间隔越小笔迹越连续；太小会给舵机堆太多目标。
+const unsigned long drawStepMs = 15;
+
+// 预生成的路径。按 D 的时候一次性把整条路径算好存进来，
+// 绘制过程中只按顺序取点，不在运动中间做浮点运算。
+//
+// 容量要按最长的模式算：曲线最多 5 个点 = 4 段，每段采样 18 个点，
+// 一共 72 个点。取 120 留足余量。
+// 每个点 3 个 int = 6 字节，120 个 = 720 字节。
+// 不能再大了：Uno 只有 2KB SRAM，之前就因为内存不足出现过动作乱执行。
+const int PATH_MAX = 120;
+struct PathPoint {
+  int b;
+  int f;
+  int r;
+};
+PathPoint pathBuf[PATH_MAX];
+int pathLen = 0;      // 路径上实际有多少个点
 
 // 绘制流程的状态
-int drawActing = 0;   // 0=空闲；1=正在回起点；2=正在绘制
-int drawStage = 0;    // 回起点的三个子步骤：1 抬臂 2 转底座 3 落下
-int drawIndex = 0;    // 当前正在走向第几个示教点
+// drawActing: 0=空闲；1=正在回起点；2=正在绘制；3=正在取消（先停住再回待机）；4=已暂停
+int drawActing = 0;
+int drawStage = 0;    // 回起点的两个子步骤：0 抬臂转底座、1 降到起点
+int pathIndex = 0;    // 当前走到路径的第几个点
+unsigned long lastDrawStep = 0;   // 上一次推进路径的时间
 unsigned long drawWaitStart = 0;   // 子步骤之间的停顿计时
+
+// 把 (x, y) 限幅后返回
+float clampf(float x, float lo, float hi) {
+  if (x < lo) return lo;
+  if (x > hi) return hi;
+  return x;
+}
+
+// Catmull-Rom 样条插值：返回 p1 到 p2 之间 t（0~1）处的值
+// p0 和 p3 是相邻点，用它们来定两端的切线方向。
+// 相邻两段的切线自动一致，所以曲线没有尖角；
+// 而且它"经过"所有给定点，是插值不是逼近（贝塞尔不经过控制点，不能用）。
+//
+// 三次形式展开后  t=0 时结果等于 p1、t=1 时等于 p2，
+// 所以在端点把 p0 夹成 p1、p3 夹成 p2，曲线就不会冲出端点外。
+float catmullRom(float p0, float p1, float p2, float p3, float t) {
+  float t2 = t * t;
+  float t3 = t2 * t;
+  return 0.5 * (
+      2.0 * p1
+    + (-p0 + p2) * t
+    + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+    + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3);
+}
+
+// 生成折线路径：相邻点之间线性采样
+// closed = true 时自动闭合（三角形的第 3 段就是 点3 -> 点1）
+void buildLinePath(bool closed) {
+  pathLen = 0;
+
+  int segCount = teachCount - 1;
+  if (closed) {
+    segCount = teachCount;   // 多走一段回到起点
+  }
+
+  for (int s = 0; s < segCount; s++) {
+    int i0 = s;
+    int i1 = (s + 1) % teachCount;   // 取模实现闭合
+
+    // 每段采样多少个点：按角度差算，最少 12 个
+    int maxDiff = abs(teachPoint[i1].b - teachPoint[i0].b);
+    if (abs(teachPoint[i1].f - teachPoint[i0].f) > maxDiff) {
+      maxDiff = abs(teachPoint[i1].f - teachPoint[i0].f);
+    }
+    if (abs(teachPoint[i1].r - teachPoint[i0].r) > maxDiff) {
+      maxDiff = abs(teachPoint[i1].r - teachPoint[i0].r);
+    }
+    int samples = maxDiff;
+    if (samples < 12) samples = 12;
+
+    for (int k = 1; k <= samples; k++) {
+      if (pathLen >= PATH_MAX) return;
+      float t = (float)k / (float)samples;
+      pathBuf[pathLen].b = teachPoint[i0].b + (int)((teachPoint[i1].b - teachPoint[i0].b) * t + 0.5);
+      pathBuf[pathLen].f = teachPoint[i0].f + (int)((teachPoint[i1].f - teachPoint[i0].f) * t + 0.5);
+      pathBuf[pathLen].r = teachPoint[i0].r + (int)((teachPoint[i1].r - teachPoint[i0].r) * t + 0.5);
+      pathLen++;
+    }
+  }
+}
+
+// 生成平滑曲线路径（Catmull-Rom）
+// closed = true 时首尾也连起来，形成闭合的平滑轮廓
+void buildCurvePath(bool closed) {
+  pathLen = 0;
+
+  int segCount = teachCount - 1;
+  if (closed) {
+    segCount = teachCount;
+  }
+
+  for (int s = 0; s < segCount; s++) {
+    int i1 = s;
+    int i2 = (s + 1) % teachCount;
+
+    // 取相邻点作为切线参考；端点处夹回自身，避免曲线冲出范围
+    int i0 = i1 - 1;
+    int i3 = i2 + 1;
+    if (closed) {
+      i0 = (i1 - 1 + teachCount) % teachCount;
+      i3 = (i2 + 1) % teachCount;
+    } else {
+      if (i0 < 0) i0 = i1;
+      if (i3 >= teachCount) i3 = i2;
+    }
+
+    int samples = 18;   // 曲线每段固定采样 18 个点（5 点 4 段 = 72 点，在 PATH_MAX 内）
+
+    for (int k = 1; k <= samples; k++) {
+      if (pathLen >= PATH_MAX) return;
+      float t = (float)k / (float)samples;
+      pathBuf[pathLen].b = (int)clampf(
+          catmullRom(teachPoint[i0].b, teachPoint[i1].b, teachPoint[i2].b, teachPoint[i3].b, t), bMin, bMax);
+      pathBuf[pathLen].f = (int)clampf(
+          catmullRom(teachPoint[i0].f, teachPoint[i1].f, teachPoint[i2].f, teachPoint[i3].f, t), fMin, fMax);
+      pathBuf[pathLen].r = (int)clampf(
+          catmullRom(teachPoint[i0].r, teachPoint[i1].r, teachPoint[i2].r, teachPoint[i3].r, t), rMin, rMax);
+      pathLen++;
+    }
+  }
+}
 
 // 显示和日志用的模式名
 const char* modeName(int m) {
   switch (m) {
-    case 0:  return "LINE";
-    case 1:  return "LETTER";
-    case 2:  return "5PT POLY";
-    default: return "5PT CURVE";
+    case MODE_LINE:  return "LINE";
+    case MODE_TRI:   return "TRI";
+    case MODE_POLY:  return "POLY";
+    default:         return "CURVE";
   }
 }
 
@@ -411,12 +563,53 @@ void teachRecordPoint() {
   Serial.println(rPos);
 }
 
-// 启动绘制：先回待机位，再按顺序走示教点
+// 让夹爪走到指定位置，只动大臂和小臂（底座、夹爪不动）
+// 底座在"回起点"的第一步就转到位了，之后一直不转，
+// 所以画笔只在手臂平面内移动，不会因为转底座而在纸上划出弧线
+void startArmMove(int fTarget, int rTarget) {
+  startJointTarget(bPos, fTarget, rTarget, cPos);
+}
+
+// 判断大臂、小臂是否都已经走到目标（底座和夹爪在绘制期间不动，不用判）
+int armReached() {
+  if (fPos == targetF && rPos == targetR) {
+    return 1;
+  }
+  return 0;
+}
+
+// 启动绘制：先转到起点的底座角度，再降到起点，然后插值走线
 void drawStart() {
   if (teachCount < 2) {
     Serial.print(F("示教点不足，当前 "));
     Serial.print(teachCount);
     Serial.println(F(" 个（至少需要 2 个）"));
+    return;
+  }
+
+  // 正在绘制时，同一个命令兼作"暂停"
+  if (drawActing == 2) {
+    drawActing = 4;
+    Serial.println(F("绘制已暂停（再按一次继续，按 Q 取消）"));
+    return;
+  }
+
+  // 已经暂停时，同一个命令兼作"继续"
+  if (drawActing == 4) {
+    drawActing = 2;
+    Serial.println(F("继续绘制"));
+    return;
+  }
+
+  // 正在回起点、或正在取消过程中，不接受新请求
+  if (drawActing != 0) {
+    Serial.println(F("正在执行绘制流程，请等待"));
+    return;
+  }
+
+  // 忙碌时不接受新的绘制请求
+  if (motionState != 0 || homeStep != 0 || actionStep != 0 || playStage != 0) {
+    Serial.println(F("正在运动，请等待"));
     return;
   }
 
@@ -426,18 +619,139 @@ void drawStart() {
   Serial.print(teachCount);
   Serial.println(F(" 个点"));
 
-  // 绘制动作尚未实现，先把已记录的示教点打印出来做校验
-  for (int i = 0; i < teachCount; i++) {
-    Serial.print(F("  点"));
-    Serial.print(i + 1);
-    Serial.print(F(": b="));
-    Serial.print(teachPoint[i].b);
-    Serial.print(F(" f="));
-    Serial.print(teachPoint[i].f);
-    Serial.print(F(" r="));
-    Serial.println(teachPoint[i].r);
+  // 按模式校验点数：三角形必须要 3 个，曲线至少 3 个
+  if (drawMode == MODE_TRI && teachCount != 3) {
+    Serial.println(F("三角形模式需要正好 3 个示教点"));
+    return;
   }
-  Serial.println(F("（绘制功能待实现，详见说明文档）"));
+  if (drawMode == MODE_CURVE && teachCount < 3) {
+    Serial.println(F("平滑曲线至少需要 3 个示教点"));
+    return;
+  }
+
+  // 按模式生成整条路径，存在 pathBuf 里。
+  // 放在这里一次算完，绘制过程中就不做浮点运算了。
+  if (drawMode == MODE_CURVE) {
+    buildCurvePath(false);      // 平滑曲线：不闭合，经过所有点
+  } else if (drawMode == MODE_TRI) {
+    buildLinePath(true);        // 三角形：折线，自动闭合
+  } else {
+    buildLinePath(false);       // 直线 / 五点折线：折线，开放
+  }
+
+  if (pathLen < 2) {
+    Serial.println(F("路径生成失败，请检查示教点"));
+    return;
+  }
+
+  Serial.print(F("路径点数 "));
+  Serial.println(pathLen);
+
+  // 先把底座转到第一个点的方向，同时把大小臂抬到安全姿态。
+  // 为什么要先抬臂：起笔点在纸面上，直接从落笔姿态转底座会拖到纸面。
+  drawActing = 1;
+  drawStage = 0;
+  startJointTarget(teachPoint[0].b, fHigh, rHigh, cPos);
+}
+
+// 取消绘制：把状态置为"正在取消"，由 drawCtrl 等当前这一段停下后再回待机
+// 不在按键处理里直接调 goHome()，是因为绘制中 motionState 还是 1，
+// goHome() 会以"正在运动，请等待"为由拒绝执行，取消就失效了
+void drawCancel() {
+  if (drawActing == 0) {
+    Serial.println(F("当前没有在绘制"));
+    return;
+  }
+
+  if (drawActing == 3) {
+    Serial.println(F("已经在取消中"));
+    return;
+  }
+
+  drawActing = 3;
+  Serial.println(F("收到取消指令，等当前动作结束后回待机"));
+}
+
+// 绘制推进：每轮 loop() 调用一次，没有到节拍就直接返回
+void drawCtrl() {
+  if (drawActing == 0) {
+    return;
+  }
+
+  // 当前这一段运动还没有走完，等它走完再说
+  if (motionState != 0) {
+    return;
+  }
+
+  // ---------- 取消：等当前这一段停下，再回待机 ----------
+  // 不直接把正在进行的运动打断，避免舵机突然反向或丢步
+  if (drawActing == 3) {
+    drawActing = 0;
+    Serial.println(F("已取消绘制，回到待机姿态"));
+    goHome();
+    return;
+  }
+
+  // ---------- 暂停：什么都不推进，进度保留 ----------
+  // pathIndex 不动，所以"继续"时从原地接着画
+  if (drawActing == 4) {
+    return;
+  }
+
+  // ---------- 阶段 1：先回到起笔点 ----------
+  if (drawActing == 1) {
+    if (drawStage == 0) {
+      // 底座已经转到起点方向、大小臂也抬起来了，下一步降到起笔点
+      drawStage = 1;
+      startArmMove(teachPoint[0].f, teachPoint[0].r);
+      return;
+    }
+
+    // 已经降到起笔点，进入绘制
+    drawActing = 2;
+    pathIndex = 0;
+    lastDrawStep = millis();
+    Serial.println(F("开始画线"));
+    return;
+  }
+
+  // ---------- 阶段 2：沿预生成的路径走点 ----------
+  // LINE / TRI / POLY / CURVE 的区别只在"路径怎么生成"，
+  // 生成之后都走同一段代码，所以暂停、继续、取消对所有模式都通用
+  if (drawActing == 2) {
+    if (pathIndex >= pathLen) {
+      drawActing = 0;
+      Serial.println(F("绘制完成"));
+      printStatus();
+      return;
+    }
+
+    // 等上一个路径点走到底
+    if (armReached() == 0) {
+      return;
+    }
+
+    // 等一个节拍，让舵机有时间真正稳定下来
+    if (millis() - lastDrawStep < drawStepMs) {
+      return;
+    }
+    lastDrawStep = millis();
+
+    startJointTarget(pathBuf[pathIndex].b,
+                     pathBuf[pathIndex].f,
+                     pathBuf[pathIndex].r,
+                     cPos);
+    pathIndex++;
+
+    // 每走 20 个点报一次进度，方便现场判断画到哪了
+    if (pathIndex % 20 == 0) {
+      Serial.print(F("进度 "));
+      Serial.print(pathIndex);
+      Serial.print(F("/"));
+      Serial.println(pathLen);
+    }
+    return;
+  }
 }
 
 // 暂存一整行串口指令，例如 x10,y30,z20
@@ -1122,16 +1436,44 @@ void armDataCmd(char name) {
     case 'M': goHome();       break;  // 按键4：回到初始姿态
 
     // ===== 按钮板按键 5~8 =====
-    case 'F':                 // 按键5：绘图模式切换 LINE/LETTER/5PT POLY/5PT CURVE
-      // 切换模式不清空示教点：折线和曲线共用同一组 5 个点
-      drawMode = (drawMode + 1) % 4;
+    // 按键5：绘图模式切换 LINE / TRI / POLY / CURVE
+    case 'F':
+      // 切换模式不清空示教点：折线和曲线可以共用同一组点
+      drawMode = (drawMode + 1) % MODE_COUNT;
       Serial.print(F("绘图模式: "));
-      Serial.println(modeName(drawMode));
+      Serial.print(modeName(drawMode));
+      // 顺手提示这个模式需要几个点，避免记错点数白画一次
+      if (drawMode == MODE_LINE) {
+        Serial.println(F("  （2 个点）"));
+      } else if (drawMode == MODE_TRI) {
+        Serial.println(F("  （正好 3 个点，自动闭合）"));
+      } else if (drawMode == MODE_POLY) {
+        Serial.println(F("  （5 个点，开放折线）"));
+      } else {
+        Serial.println(F("  （3~5 个点，平滑曲线）"));
+      }
       break;
 
-    case 'D': drawStart();        break;  // 按键6：开始绘制
+    // 按键6：开始 / 暂停 / 继续（同一个字符，按当前状态区分语义）
+    case 'D': drawStart();        break;
     case 'I': teachRecordPoint(); break;  // 按键7：记录当前示教点
-    case 'Q': goHome();           break;  // 按键8：取消并回到初始姿态（示教点保留）
+    // 按键8：取消绘制并回待机（没有在绘制时就是普通的回中）
+    case 'Q':
+      if (drawActing != 0) {
+        drawCancel();
+      } else {
+        goHome();
+      }
+      break;
+
+    case 'U':   // 串口备用：直接继续绘制（不用靠 D 键循环）
+      if (drawActing == 4) {
+        drawActing = 2;
+        Serial.println(F("继续绘制"));
+      } else {
+        Serial.println(F("当前不在暂停状态"));
+      }
+      break;
 
     default:
       Serial.println(F("无法识别指令"));
@@ -1185,7 +1527,8 @@ void readCmd() {
           name == 'P' || name == 'A' || name == 'B' || name == 'C' || 
           name == 'M' || name == 'N' || name == 'R' || name == 'T' ||
           name == 'K' ||
-          name == 'F' || name == 'D' || name == 'I' || name == 'Q') {
+          name == 'F' || name == 'D' || name == 'I' || name == 'Q' ||
+          name == 'U') {
         armDataCmd(data);
       } else if (lineLength < 39) {
         serialLine[lineLength] = data;
@@ -1322,9 +1665,11 @@ void loop() {
   homeCtrl();
   actionCtrl();
   playCtrl();
+  drawCtrl();      // 任务五：绘制推进
 
   // 所有自动流程都空闲，才允许摇杆控制
-  if (motionState == 0 && homeStep == 0 && actionStep == 0 && playStage == 0) {
+  if (motionState == 0 && homeStep == 0 && actionStep == 0 &&
+      playStage == 0 && drawActing == 0) {
     unsigned long now = millis();
     if (now - lastJoyStep >= (unsigned long)DSD) {
       lastJoyStep = now;
