@@ -34,4 +34,16 @@ struct RecordFrame {
   byte c;
 };
 
+// 任务四模型中的末端坐标，单位毫米。
+struct CartesianPoint {
+  float x;
+  float y;
+  float z;
+};
+
+// 任务五诊断：区分模型不可达、余量、舵机限位和轨迹步长。
+enum DrawError {
+  DRAW_OK, DRAW_NONFINITE, DRAW_AXIS, DRAW_UNREACHABLE,
+  DRAW_SINGULAR_MARGIN, DRAW_JOINT_LIMIT, DRAW_STEP_LIMIT, DRAW_SAMPLE_LIMIT
+};
 #endif

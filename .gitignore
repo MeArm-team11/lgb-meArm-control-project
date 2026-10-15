@@ -1,0 +1,19 @@
+# Local Arduino build outputs (source sketches remain tracked)
+/avr-build/
+/build/
+*.o
+*.a
+*.elf
+*.hex
+*.eep
+*.map
+
+# Intermediate task-five backups; keep them outside the repository
+/任务五/task5_drawing/*.bak*
+/任务五/task5_drawing_backup_*/
+
+# OS/editor temporary files
+.DS_Store
+Thumbs.db
+*.swp
+*~
